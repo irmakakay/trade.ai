@@ -1,0 +1,28 @@
+name: CI Python NN Worker
+on:
+  push:
+    paths:
+      - 'src/quant_nn_worker/**'
+      - 'tests/quant_nn_tests/**'
+  pull_request:
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r src/quant_nn_worker/requirements.txt pytest pytest-asyncio pytest-cov ruff mypy
+      - name: Lint & Typecheck
+        run: |
+          ruff check src/quant_nn_worker tests/quant_nn_tests
+      - name: Pytest with Coverage Gate (>=85%)
+        env:
+          PYTHONPATH: src/quant_nn_worker
+        run: |
+          pytest tests/quant_nn_tests --cov=src/quant_nn_worker --cov-fail-under=85

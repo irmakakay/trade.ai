@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quant} -d ${POSTGRES_DB:-quantcore}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrations:
+    build:
+      context: ./migrations
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  nn-worker:
+    build:
+      context: ./src/quant_nn_worker
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      POOL_REPLICATION_FACTOR: ${POOL_REPLICATION_FACTOR:-3}
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.75}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  quant-api:
+    build:
+      context: .
+      dockerfile: src/QuantCore.Api/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      POSTGRES_CONNECTION: Host=postgres;Port=5432;Database=${POSTGRES_DB:-quantcore};Username=${POSTGRES_USER:-quant};Password=${POSTGRES_PASSWORD:-quant_secret}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      POOL_REPLICATION_FACTOR: ${POOL_REPLICATION_FACTOR:-3}
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.75}
+      LOCK_TTL_SECONDS: ${LOCK_TTL_SECONDS:-5}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy

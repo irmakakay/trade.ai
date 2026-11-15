@@ -1,0 +1,46 @@
+name: CI Infra & Migration Idempotency
+on:
+  push:
+    paths:
+      - 'migrations/**'
+      - 'docker-compose*.yml'
+  pull_request:
+jobs:
+  migration-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: quantcore
+          POSTGRES_USER: quant
+          POSTGRES_PASSWORD: quant_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install psycopg[binary]
+      - name: Run Migrations Pass 1 (Initialize)
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: quantcore
+          POSTGRES_USER: quant
+          POSTGRES_PASSWORD: quant_secret
+        run: python migrations/runner.py
+      - name: Run Migrations Pass 2 (Verify Idempotency)
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: quantcore
+          POSTGRES_USER: quant
+          POSTGRES_PASSWORD: quant_secret
+        run: python migrations/runner.py

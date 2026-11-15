@@ -1,0 +1,19 @@
+name: CI .NET API & Contracts
+on:
+  push:
+    paths:
+      - 'src/QuantCore.*/**'
+      - 'tests/QuantCore.Tests/**'
+  pull_request:
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore & Build
+        run: dotnet build QuantCore.sln --configuration Release
+      - name: Run xUnit with Coverage Gate
+        run: dotnet test tests/QuantCore.Tests/QuantCore.Tests.csproj --configuration Release /p:CollectCoverage=true /p:Threshold=80 /p:ThresholdType=line

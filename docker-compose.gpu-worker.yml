@@ -1,0 +1,21 @@
+services:
+  nn-worker-gpu:
+    build:
+      context: ./src/quant_nn_worker
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: ${PRIMARY_NODE_LAN_IP:-10.0.0.212}
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+      RABBITMQ_HOST: ${PRIMARY_NODE_LAN_IP:-10.0.0.212}
+      RABBITMQ_PORT: 5672
+      TORCH_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
