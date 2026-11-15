@@ -21,10 +21,10 @@ public sealed class ContractParityTests
         );
 
         string json = JsonSerializer.Serialize(msg);
-        Assert.Contains(""job_id":", json);
-        Assert.Contains(""command":"RECALCULATE_POOL"", json);
-        Assert.Contains(""risk_dial_r":0.85", json);
-        Assert.Contains(""replication_factor":3", json);
+        Assert.Contains("\"job_id\":", json);
+        Assert.Contains("\"command\":\"RECALCULATE_POOL\"", json);
+        Assert.Contains("\"risk_dial_r\":0.85", json);
+        Assert.Contains("\"replication_factor\":3", json);
     }
 
     [Fact]
