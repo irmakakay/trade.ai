@@ -4,6 +4,8 @@ on:
     paths:
       - 'src/QuantCore.*/**'
       - 'tests/QuantCore.Tests/**'
+      - 'tests/QuantCore.IntegrationTests/**'
+      - 'migrations/versions/**'
   pull_request:
 jobs:
   build-and-test:
@@ -17,3 +19,13 @@ jobs:
         run: dotnet build QuantCore.sln --configuration Release
       - name: Run xUnit with Coverage Gate
         run: dotnet test tests/QuantCore.Tests/QuantCore.Tests.csproj --configuration Release /p:CollectCoverage=true "/p:Include=[QuantCore.Contracts]*" /p:Threshold=80 /p:ThresholdType=line
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      # Testcontainers starts real Postgres 16 and RabbitMQ 3 via the runner's Docker daemon.
+      - name: Run Integration Tests with Api Coverage Report
+        run: dotnet test tests/QuantCore.IntegrationTests/QuantCore.IntegrationTests.csproj --configuration Release /p:CollectCoverage=true "/p:Include=[QuantCore.Api]*" "/p:ExcludeByFile=**/Program.cs"

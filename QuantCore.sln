@@ -1,16 +1,50 @@
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.8.34330.188
+VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.Contracts", "src\QuantCore.Contracts\QuantCore.Contracts.csproj", "{A1111111-1111-1111-1111-111111111111}"
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{EB10A094-C356-4473-9BC1-8F6C1D49F07D}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.Api", "src\QuantCore.Api\QuantCore.Api.csproj", "{B2222222-2222-2222-2222-222222222222}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.Contracts", "src\QuantCore.Contracts\QuantCore.Contracts.csproj", "{A64AE016-BC88-40C5-A8CA-5A479C3B309E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.Tests", "tests\QuantCore.Tests\QuantCore.Tests.csproj", "{C3333333-3333-3333-3333-333333333333}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.Api", "src\QuantCore.Api\QuantCore.Api.csproj", "{99BFCA5D-2B62-4B79-81FF-CD9972CF7399}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{1CD052F0-088E-4C9C-89B6-C66BD8EF9755}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.Tests", "tests\QuantCore.Tests\QuantCore.Tests.csproj", "{9C96423D-CFFB-4C01-B154-7BCF40B8E182}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuantCore.IntegrationTests", "tests\QuantCore.IntegrationTests\QuantCore.IntegrationTests.csproj", "{58C5CE15-3385-45E0-B067-23BFCCF8CFE4}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
 		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A64AE016-BC88-40C5-A8CA-5A479C3B309E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A64AE016-BC88-40C5-A8CA-5A479C3B309E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A64AE016-BC88-40C5-A8CA-5A479C3B309E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A64AE016-BC88-40C5-A8CA-5A479C3B309E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{99BFCA5D-2B62-4B79-81FF-CD9972CF7399}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{99BFCA5D-2B62-4B79-81FF-CD9972CF7399}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{99BFCA5D-2B62-4B79-81FF-CD9972CF7399}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{99BFCA5D-2B62-4B79-81FF-CD9972CF7399}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9C96423D-CFFB-4C01-B154-7BCF40B8E182}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9C96423D-CFFB-4C01-B154-7BCF40B8E182}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9C96423D-CFFB-4C01-B154-7BCF40B8E182}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9C96423D-CFFB-4C01-B154-7BCF40B8E182}.Release|Any CPU.Build.0 = Release|Any CPU
+		{58C5CE15-3385-45E0-B067-23BFCCF8CFE4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{58C5CE15-3385-45E0-B067-23BFCCF8CFE4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{58C5CE15-3385-45E0-B067-23BFCCF8CFE4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{58C5CE15-3385-45E0-B067-23BFCCF8CFE4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{A64AE016-BC88-40C5-A8CA-5A479C3B309E} = {EB10A094-C356-4473-9BC1-8F6C1D49F07D}
+		{99BFCA5D-2B62-4B79-81FF-CD9972CF7399} = {EB10A094-C356-4473-9BC1-8F6C1D49F07D}
+		{9C96423D-CFFB-4C01-B154-7BCF40B8E182} = {1CD052F0-088E-4C9C-89B6-C66BD8EF9755}
+		{58C5CE15-3385-45E0-B067-23BFCCF8CFE4} = {1CD052F0-088E-4C9C-89B6-C66BD8EF9755}
 	EndGlobalSection
 EndGlobal
