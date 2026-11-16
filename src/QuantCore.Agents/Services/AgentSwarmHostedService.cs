@@ -5,8 +5,18 @@ using QuantCore.Contracts.Domain;
 
 namespace QuantCore.Agents.Services;
 
+public sealed record ParsedStrategyParams(
+    decimal EntryThreshold,
+    decimal StopLossAtr,
+    decimal TakeProfitRr,
+    decimal MaxSliceClaimPct
+);
+
 public sealed class AgentSwarmHostedService : BackgroundService
 {
+    private const decimal TakerFeeRate = 0.0010m;
+    private const decimal BaseAtrPct = 0.0080m; // 80 bps baseline volatility unit
+
     private readonly IQuantApiClient _apiClient;
     private readonly IPositionSettlementStrategy _settlementStrategy;
     private readonly IEpisodeCommandWatcher _commandWatcher;
@@ -34,29 +44,16 @@ public sealed class AgentSwarmHostedService : BackgroundService
         int maxEpisodeSeconds = _config.GetValue<int>("EPISODE_MAX_SECONDS", 300);
         Guid agentId = Guid.NewGuid();
 
-        _logger.LogInformation(
-            "[Agent {AgentId}] Booted in --mode agent | Profile={Profile} | Settlement={Settlement}",
-            agentId, profileKey, _settlementStrategy.StrategyName);
-
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
+            var slot = await _apiClient.CheckoutStrategySlotAsync(agentId, profileKey, stoppingToken);
+            if (slot is null)
             {
-                var slot = await _apiClient.CheckoutStrategySlotAsync(agentId, profileKey, stoppingToken);
-                if (slot is null)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
-                    continue;
-                }
-
-                await RunSingleEpisodeAsync(agentId, slot, maxTicksPerEpisode, maxEpisodeSeconds, stoppingToken);
-            }
-            catch (HttpRequestException ex)
-            {
-                // API not ready yet or transient failure: back off instead of crashing the host.
-                _logger.LogWarning("[Agent {AgentId}] QuantCore.Api call failed: {Message}", agentId, ex.Message);
                 await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
+                continue;
             }
+
+            await RunSingleEpisodeAsync(agentId, slot, maxTicksPerEpisode, maxEpisodeSeconds, stoppingToken);
         }
     }
 
@@ -67,31 +64,15 @@ public sealed class AgentSwarmHostedService : BackgroundService
         int maxSeconds,
         CancellationToken stoppingToken)
     {
-        var symbols = JsonSerializer.Deserialize<List<string>>(slot.CandidateSymbolsJson) ?? new List<string> { "SOLUSDT" };
+        var candidateSymbols = JsonSerializer.Deserialize<List<string>>(slot.CandidateSymbolsJson)
+            ?? new List<string> { "SOLUSDT" };
+        var strat = ParseStrategyPayload(slot.StrategyPayloadJson);
+
         var openQuantities = new Dictionary<string, decimal>();
+        var entryPrices = new Dictionary<string, decimal>();
         var latestPrices = new Dictionary<string, decimal>();
         var moves = new List<ExecutedMoveRecord>();
 
-        // 1. Iterate ranked symbols & claim First-Wins slice
-        foreach (var sym in symbols)
-        {
-            var claim = await _apiClient.ClaimSymbolSliceAsync(
-                new ShareSliceClaimRequest(agentId, slot.PoolInstanceId, sym, 0.25m, "LONG_ACCUMULATING"),
-                stoppingToken);
-
-            if (claim is { Claimed: true, ReservedQuantity: > 0m })
-            {
-                openQuantities[sym] = claim.ReservedQuantity;
-                latestPrices[sym] = 150.0m;
-                moves.Add(new ExecutedMoveRecord(
-                    sym, "BUY_SLICE_CLAIM", claim.ReservedQuantity, 150.0m,
-                    Math.Round(claim.ReservedQuantity * 150.0m * 0.001m, 8),
-                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
-                break;
-            }
-        }
-
-        // 2. Run Episode until Tick Quota, Time Window, or Precedence Reset Command
         using var durationCts = new CancellationTokenSource(TimeSpan.FromSeconds(maxSeconds));
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
             stoppingToken,
@@ -99,32 +80,132 @@ public sealed class AgentSwarmHostedService : BackgroundService
             _commandWatcher.CurrentEpisodeResetToken);
 
         int ticksProcessed = 0;
-        decimal realizedPnl = 0m;
-        decimal maxDrawdown = 0.015m;
+        decimal realizedPnlUsdt = 0m;
+        decimal initialNotionalUsdt = 0m;
+        decimal peakEquityUsdt = 0m;
+        decimal prevEquityUsdt = 0m;
+        decimal maxDrawdownPct = 0m;
+
+        // Welford online variance accumulators for tick-by-tick returns
+        int returnCount = 0;
+        double meanReturn = 0.0;
+        double m2Return = 0.0;
 
         try
         {
             while (ticksProcessed < maxTicks && !linkedCts.Token.IsCancellationRequested)
             {
-                if (_commandWatcher.MarketTicksReader.TryRead(out var tick))
+                var tick = await _commandWatcher.MarketTicksReader.ReadAsync(linkedCts.Token);
+                if (tick.Price <= 0m) continue;
+
+                latestPrices[tick.Symbol] = tick.Price;
+                ticksProcessed++;
+
+                // 1. Entry Claim: If we haven't claimed a slice yet and this tick matches a candidate symbol
+                if (openQuantities.Count == 0 && entryPrices.Count == 0 && candidateSymbols.Contains(tick.Symbol))
                 {
-                    latestPrices[tick.Symbol] = tick.Price;
-                    ticksProcessed++;
-                    realizedPnl += 0.25m;
+                    var claim = await _apiClient.ClaimSymbolSliceAsync(
+                        new ShareSliceClaimRequest(
+                            agentId,
+                            slot.PoolInstanceId,
+                            tick.Symbol,
+                            strat.MaxSliceClaimPct,
+                            "LONG_ACCUMULATING"),
+                        linkedCts.Token);
+
+                    if (claim is { Claimed: true, ReservedQuantity: > 0m })
+                    {
+                        decimal entryFee = Math.Round(claim.ReservedQuantity * tick.Price * TakerFeeRate, 8);
+                        openQuantities[tick.Symbol] = claim.ReservedQuantity;
+                        entryPrices[tick.Symbol] = tick.Price;
+                        realizedPnlUsdt -= entryFee;
+
+                        initialNotionalUsdt = claim.ReservedQuantity * tick.Price;
+                        peakEquityUsdt = initialNotionalUsdt - entryFee;
+                        prevEquityUsdt = peakEquityUsdt;
+
+                        moves.Add(new ExecutedMoveRecord(
+                            tick.Symbol,
+                            "BUY_SLICE_CLAIM",
+                            claim.ReservedQuantity,
+                            tick.Price,
+                            entryFee,
+                            tick.TimestampMs));
+                    }
+                    continue;
                 }
-                else
+
+                // 2. Mark-to-Market Valuation, Stop-Loss / Take-Profit Check & Online Sharpe Update
+                if (openQuantities.TryGetValue(tick.Symbol, out decimal heldQty) && heldQty > 0m)
                 {
-                    await Task.Delay(50, linkedCts.Token);
-                    ticksProcessed++;
+                    decimal entryPrice = entryPrices[tick.Symbol];
+                    decimal priceReturnPct = (tick.Price - entryPrice) / entryPrice;
+
+                    decimal stopLossPct = -strat.StopLossAtr * BaseAtrPct;
+                    decimal takeProfitPct = strat.StopLossAtr * BaseAtrPct * strat.TakeProfitRr;
+
+                    decimal currentPositionValue = heldQty * tick.Price;
+                    decimal currentEquity = initialNotionalUsdt + realizedPnlUsdt + (heldQty * (tick.Price - entryPrice));
+
+                    if (prevEquityUsdt > 0m)
+                    {
+                        double stepRet = (double)((currentEquity - prevEquityUsdt) / prevEquityUsdt);
+                        returnCount++;
+                        double delta = stepRet - meanReturn;
+                        meanReturn += delta / returnCount;
+                        double delta2 = stepRet - meanReturn;
+                        m2Return += delta * delta2;
+                    }
+                    prevEquityUsdt = currentEquity;
+
+                    if (currentEquity > peakEquityUsdt)
+                    {
+                        peakEquityUsdt = currentEquity;
+                    }
+                    else if (peakEquityUsdt > 0m)
+                    {
+                        decimal dd = (peakEquityUsdt - currentEquity) / peakEquityUsdt;
+                        if (dd > maxDrawdownPct) maxDrawdownPct = Math.Round(dd, 4);
+                    }
+
+                    // Dynamic Stop-Loss or Take-Profit Exit
+                    if (priceReturnPct <= stopLossPct || priceReturnPct >= takeProfitPct)
+                    {
+                        string exitAction = priceReturnPct >= takeProfitPct ? "SELL_TAKE_PROFIT" : "SELL_STOP_LOSS";
+                        decimal exitFee = Math.Round(currentPositionValue * TakerFeeRate, 8);
+                        decimal tradeGrossPnl = heldQty * (tick.Price - entryPrice);
+
+                        realizedPnlUsdt += tradeGrossPnl - exitFee;
+                        openQuantities[tick.Symbol] = 0m;
+
+                        moves.Add(new ExecutedMoveRecord(
+                            tick.Symbol,
+                            exitAction,
+                            heldQty,
+                            tick.Price,
+                            exitFee,
+                            tick.TimestampMs));
+                        break; // Position closed; settle episode immediately
+                    }
                 }
             }
         }
         catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
         {
-            _logger.LogInformation("[Agent {AgentId}] Episode interrupted early by Precedence Reset or Time Window.", agentId);
+            _logger.LogInformation("[Agent {AgentId}] Episode interrupted by Precedence Reset or Time Window.", agentId);
         }
 
-        // 3. Settle Positions via Injected IPositionSettlementStrategy & Flush History
+        // If position is still open at episode end, include unrealized PnL in baseline before settlement strategy runs
+        foreach (var (sym, qty) in openQuantities)
+        {
+            if (qty > 0m && latestPrices.TryGetValue(sym, out decimal lastP) && entryPrices.TryGetValue(sym, out decimal entP))
+            {
+                realizedPnlUsdt += qty * (lastP - entP);
+            }
+        }
+
+        decimal sharpeEstimate = ComputeAnnualizedSharpe(returnCount, meanReturn, m2Return);
+
         var context = new ActiveAgentContext(
             RunId: Guid.NewGuid(),
             PoolInstanceId: slot.PoolInstanceId,
@@ -134,13 +215,42 @@ public sealed class AgentSwarmHostedService : BackgroundService
             ReplicaIndex: slot.ReplicaIndex,
             JitterDeltaJson: slot.JitterDeltaJson,
             ExecutedMoves: moves,
-            RealizedPnlUsdt: realizedPnl,
-            MaxDrawdownPct: maxDrawdown,
-            SharpeEstimate: 1.65m,
+            RealizedPnlUsdt: Math.Round(realizedPnlUsdt, 8),
+            MaxDrawdownPct: Math.Round(maxDrawdownPct, 4),
+            SharpeEstimate: sharpeEstimate,
             OpenSymbolQuantities: openQuantities,
             LatestMarketPrices: latestPrices
         );
 
         return await _settlementStrategy.SettleEpisodeAsync(context, stoppingToken);
+    }
+
+    public static ParsedStrategyParams ParseStrategyPayload(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            decimal entry = root.TryGetProperty("entry_threshold", out var e) ? e.GetDecimal() : 0.60m;
+            decimal sl = root.TryGetProperty("stop_loss_atr", out var s) ? s.GetDecimal() : 1.50m;
+            decimal tp = root.TryGetProperty("take_profit_rr", out var t) ? t.GetDecimal() : 2.00m;
+            decimal slice = root.TryGetProperty("max_slice_claim_pct", out var m) ? m.GetDecimal() : 0.25m;
+            return new ParsedStrategyParams(entry, sl, tp, Math.Clamp(slice, 0.01m, 1.0m));
+        }
+        catch
+        {
+            return new ParsedStrategyParams(0.60m, 1.50m, 2.00m, 0.25m);
+        }
+    }
+
+    public static decimal ComputeAnnualizedSharpe(int count, double mean, double m2)
+    {
+        if (count < 2) return 0m;
+        double variance = m2 / (count - 1);
+        double stdDev = Math.Sqrt(Math.Max(variance, 1e-12));
+        if (stdDev <= 1e-9) return 0m;
+        // Scale step Sharpe by sqrt(N) capped to [-10, 10]
+        double rawSharpe = (mean / stdDev) * Math.Sqrt(count);
+        return Math.Round((decimal)Math.Clamp(rawSharpe, -10.0, 10.0), 4);
     }
 }

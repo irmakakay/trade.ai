@@ -59,4 +59,19 @@ public sealed class EpisodeCommandWatcherTests
         Assert.True(result!.Committed);
         await settlement.Received(1).SettleEpisodeAsync(Arg.Any<ActiveAgentContext>(), Arg.Any<CancellationToken>());
     }
+
+    [Fact]
+    public void ComputeAnnualizedSharpe_And_ParseStrategyPayload_Are_Accurate()
+    {
+        var parsed = AgentSwarmHostedService.ParseStrategyPayload(
+            "{\"entry_threshold\":0.72,\"stop_loss_atr\":1.8,\"take_profit_rr\":2.5,\"max_slice_claim_pct\":0.35}");
+
+        Assert.Equal(0.72m, parsed.EntryThreshold);
+        Assert.Equal(1.8m, parsed.StopLossAtr);
+        Assert.Equal(2.5m, parsed.TakeProfitRr);
+        Assert.Equal(0.35m, parsed.MaxSliceClaimPct);
+
+        decimal sharpe = AgentSwarmHostedService.ComputeAnnualizedSharpe(count: 25, mean: 0.0015, m2: 0.00024);
+        Assert.True(sharpe > 0m);
+    }
 }
