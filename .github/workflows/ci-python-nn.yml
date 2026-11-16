@@ -6,6 +6,7 @@ on:
       - 'src/quant_nn_engine/**'
       - 'tests/quant_nn_worker_tests/**'
       - 'tests/quant_nn_engine_tests/**'
+      - 'ruff.toml'
   pull_request:
 jobs:
   pytest:
