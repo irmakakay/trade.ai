@@ -32,7 +32,6 @@ def generate_epsilon_jittered_pool(
     epsilon_scale: float = 0.025,
     seed: int = 42,
 ) -> List[Dict]:
-    rng = np.random.default_rng(seed)
     replicas = []
     keys = sorted(base_strategy.keys())
 

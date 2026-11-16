@@ -1,6 +1,5 @@
 import io
 import json
-from uuid import uuid4
 import torch
 
 class PostgresCheckpointStore:

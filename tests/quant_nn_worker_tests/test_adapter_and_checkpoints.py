@@ -3,7 +3,6 @@ from uuid import uuid4
 import torch
 from adapter.checkpoint_store import PostgresCheckpointStore
 from adapter.queue_consumer import process_single_task
-from adapter.schemas import InputTaskMessage, TaskCommandType
 
 class FakeQueueMethod:
     def __init__(self, count: int):

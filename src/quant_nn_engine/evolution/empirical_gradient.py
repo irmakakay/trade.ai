@@ -28,8 +28,6 @@ def evolve_base_strategy_from_histories(
     scored.sort(key=lambda pair: pair[0], reverse=True)
     best_fitness, winner = scored[0]
 
-    # Compute weighted average delta across replicas that beat the median
-    median_fit = scored[len(scored) // 2][0]
     updated = {}
     for key, base_val in current_base.items():
         win_delta = winner.jitter_delta.get(key, 0.0)
