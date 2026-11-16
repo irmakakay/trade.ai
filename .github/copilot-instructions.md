@@ -10,7 +10,7 @@ Do **NOT** eagerly load every file inside `skills/references/`. Follow the lazy-
 | :--- | :--- |
 | System boundaries, Docker Compose, or RabbitMQ queues | [`skills/references/architecture-invariants.md`](../skills/references/architecture-invariants.md) |
 | `src/QuantCore.Api/**` or `src/QuantCore.Contracts/**` (.NET 8) | [`skills/references/dotnet-api-practices.md`](../skills/references/dotnet-api-practices.md) |
-| `src/quant_nn_worker/**` (Python Adapter & PyTorch Brain) | [`skills/references/python-nn-practices.md`](../skills/references/python-nn-practices.md) |
+| `src/quant_nn_worker/**` or `src/quant_nn_engine/**` (Python Adapter & PyTorch Brain/Engine) | [`skills/references/python-nn-practices.md`](../skills/references/python-nn-practices.md) |
 | `migrations/**` or PostgreSQL lock/pool SQL queries | [`skills/references/postgres-concurrency.md`](../skills/references/postgres-concurrency.md) |
 | `src/quant-ui/**` (React 18 + Lightweight Charts WS UI) | [`skills/references/react-realtime-ui.md`](../skills/references/react-realtime-ui.md) |
 | `tests/**` or `.github/workflows/**` | [`skills/references/testing-and-cicd.md`](../skills/references/testing-and-cicd.md) |

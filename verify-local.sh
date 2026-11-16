@@ -78,10 +78,18 @@ fi
 step "4/7 Running Unit & Contract Parity Tests"
 info "Running Python Pytest suite inside nn-worker image..."
 if docker compose run --rm -v "$(pwd)/tests:/tests" -e PYTHONPATH=/worker nn-worker \
-  sh -c "pip install -q pytest pytest-cov && pytest /tests/quant_nn_tests -q"; then
+  sh -c "pip install -q pytest pytest-cov && pytest /tests/quant_nn_worker_tests -q"; then
   ok "Python NN Worker unit tests (Queue fallback, BYTEA serde, Epsilon jitter) passed"
 else
   fail "Python NN Worker unit tests failed"
+fi
+
+info "Running Python Pytest suite for quant_nn_engine inside nn-worker image..."
+if docker compose run --rm -v "$(pwd)/tests:/tests" -v "$(pwd)/src/quant_nn_engine:/engine" -e PYTHONPATH=/engine nn-worker \
+  sh -c "pip install -q pytest pytest-cov && pytest /tests/quant_nn_engine_tests -q"; then
+  ok "Python NN Engine unit tests (indicators, multi-head net, evolution, state codec) passed"
+else
+  fail "Python NN Engine unit tests failed"
 fi
 
 info "Running .NET 8 xUnit & Contract Parity tests..."

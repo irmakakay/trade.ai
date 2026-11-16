@@ -10,7 +10,7 @@
 Do NOT read all files below. Read strictly the reference matching your active file target:
 - Editing system boundaries, queues, or Docker topology -> `skills/references/architecture-invariants.md`
 - Editing `src/QuantCore.Api/**` or `src/QuantCore.Contracts/**` -> `skills/references/dotnet-api-practices.md`
-- Editing `src/quant_nn_worker/**` -> `skills/references/python-nn-practices.md`
+- Editing `src/quant_nn_worker/**` or `src/quant_nn_engine/**` -> `skills/references/python-nn-practices.md`
 - Editing `migrations/**` or SQL queries -> `skills/references/postgres-concurrency.md`
 - Editing `src/quant-ui/**` -> `skills/references/react-realtime-ui.md`
 - Editing `tests/**` or `.github/workflows/**` -> `skills/references/testing-and-cicd.md`

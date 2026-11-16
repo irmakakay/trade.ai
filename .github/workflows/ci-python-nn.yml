@@ -1,9 +1,11 @@
-name: CI Python NN Worker
+name: CI Python NN Worker & Engine
 on:
   push:
     paths:
       - 'src/quant_nn_worker/**'
-      - 'tests/quant_nn_tests/**'
+      - 'src/quant_nn_engine/**'
+      - 'tests/quant_nn_worker_tests/**'
+      - 'tests/quant_nn_engine_tests/**'
   pull_request:
 jobs:
   pytest:
@@ -17,12 +19,17 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install -r src/quant_nn_worker/requirements.txt pytest pytest-asyncio pytest-cov ruff mypy
+          pip install -r src/quant_nn_worker/requirements.txt -r src/quant_nn_engine/requirements.txt pytest pytest-asyncio pytest-cov ruff mypy
       - name: Lint & Typecheck
         run: |
-          ruff check src/quant_nn_worker tests/quant_nn_tests
-      - name: Pytest with Coverage Gate (>=85%)
+          ruff check src/quant_nn_worker src/quant_nn_engine tests/quant_nn_worker_tests tests/quant_nn_engine_tests
+      - name: Pytest Worker with Coverage Gate (>=85%)
         env:
           PYTHONPATH: src/quant_nn_worker
         run: |
-          pytest tests/quant_nn_tests --cov=src/quant_nn_worker --cov-fail-under=85
+          pytest tests/quant_nn_worker_tests --cov=src/quant_nn_worker --cov-fail-under=85
+      - name: Pytest Engine with Coverage Gate (>=85%)
+        env:
+          PYTHONPATH: src/quant_nn_engine
+        run: |
+          pytest tests/quant_nn_engine_tests --cov=src/quant_nn_engine --cov-fail-under=85
