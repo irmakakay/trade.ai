@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - 'src/quant-ui/**'
+      - '.github/workflows/ci-react-ui.yml'
   pull_request:
 jobs:
   ui-build:

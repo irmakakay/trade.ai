@@ -7,6 +7,7 @@ on:
       - 'tests/quant_nn_worker_tests/**'
       - 'tests/quant_nn_engine_tests/**'
       - 'ruff.toml'
+      - '.github/workflows/ci-python-nn.yml'
   pull_request:
 jobs:
   pytest:

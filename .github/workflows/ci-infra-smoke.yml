@@ -4,6 +4,7 @@ on:
     paths:
       - 'migrations/**'
       - 'docker-compose*.yml'
+      - '.github/workflows/ci-infra-smoke.yml'
   pull_request:
 jobs:
   migration-smoke:

@@ -6,6 +6,8 @@ on:
       - 'tests/QuantCore.Tests/**'
       - 'tests/QuantCore.IntegrationTests/**'
       - 'migrations/versions/**'
+      - 'QuantCore.sln'
+      - '.github/workflows/ci-dotnet.yml'
   pull_request:
 jobs:
   build-and-test:
