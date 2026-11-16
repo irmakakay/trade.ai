@@ -5,6 +5,7 @@
 bin/
 obj/
 *.user
+coverage.json
 
 # Python
 __pycache__/
