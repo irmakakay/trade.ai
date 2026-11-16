@@ -79,3 +79,21 @@ services:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
+
+  # Opt-in so agents don't consume pool slots during verify-local.sh: docker compose --profile agents up --scale quant-agents=3
+  quant-agents:
+    profiles: ["agents"]
+    build:
+      context: .
+      dockerfile: src/QuantCore.Agents/Dockerfile
+    command: ["--mode", "agent"]
+    environment:
+      QUANT_API_URL: http://quant-api:8080
+      QUANT_API_WS_URL: ws://quant-api:8080/api/v1/stream/live
+      AGENT_PROFILE_KEY: ${AGENT_PROFILE_KEY:-AGGRESSIVE_BREAKOUT}
+      EPISODE_SETTLEMENT_MODE: ${EPISODE_SETTLEMENT_MODE:-LIQUIDATE_AND_RELEASE}
+      EPISODE_MAX_TICKS: ${EPISODE_MAX_TICKS:-100}
+      EPISODE_MAX_SECONDS: ${EPISODE_MAX_SECONDS:-300}
+    depends_on:
+      quant-api:
+        condition: service_started

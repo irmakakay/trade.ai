@@ -120,4 +120,64 @@ public sealed class ContractSerializationTests
         Assert.Equal(frame, copy);
         Assert.True(frame == copy);
     }
+
+    [Fact]
+    public void EpisodeCommitRequest_Uses_SnakeCase_And_RoundTrips_Moves()
+    {
+        var moves = new[] { new ExecutedMoveRecord("SOLUSDT", "BUY_SLICE_CLAIM", 10m, 150m, 1.5m, 1700000000000L) };
+        var req = new EpisodeCommitRequest(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "AGENT", "P", 2,
+            "{\"a\":1}", moves, 40m, 0.03m, 1.8m, true);
+
+        var copy = RoundTrip(req, out var json);
+
+        Assert.Contains("\"run_id\":", json);
+        Assert.Contains("\"liquidate_and_release_slices\":true", json);
+        Assert.Contains("\"fill_price\":150", json);
+        Assert.Equal(req.RunId, copy.RunId);
+        Assert.Equal(req.PoolInstanceId, copy.PoolInstanceId);
+        Assert.Equal(req.IdentityId, copy.IdentityId);
+        Assert.Equal(req.ActorType, copy.ActorType);
+        Assert.Equal(req.ProfileKey, copy.ProfileKey);
+        Assert.Equal(req.ReplicaIndex, copy.ReplicaIndex);
+        Assert.Equal(req.JitterDeltaJson, copy.JitterDeltaJson);
+        Assert.Equal(req.RealizedPnlUsdt, copy.RealizedPnlUsdt);
+        Assert.Equal(req.MaxDrawdownPct, copy.MaxDrawdownPct);
+        Assert.Equal(req.SharpeEstimate, copy.SharpeEstimate);
+        Assert.True(copy.LiquidateAndReleaseSlices);
+        var move = Assert.Single(copy.ExecutedMoves);
+        Assert.Equal(moves[0], move);
+        Assert.Equal("SOLUSDT", move.Symbol);
+        Assert.Equal("BUY_SLICE_CLAIM", move.Action);
+        Assert.Equal(10m, move.Quantity);
+        Assert.Equal(1.5m, move.FeeUsdt);
+        Assert.Equal(1700000000000L, move.TimestampMs);
+    }
+
+    [Fact]
+    public void EpisodeCommitResponse_RoundTrips()
+    {
+        var res = new EpisodeCommitResponse(true, Guid.NewGuid(), 3, true);
+
+        var copy = RoundTrip(res, out var json);
+
+        Assert.Contains("\"slices_released\":3", json);
+        Assert.Contains("\"recalculation_triggered\":true", json);
+        Assert.True(copy.Committed);
+        Assert.Equal(res.RunId, copy.RunId);
+        Assert.Equal(3, copy.SlicesReleased);
+        Assert.True(copy.RecalculationTriggered);
+    }
+
+    [Fact]
+    public void EpisodeResetCommand_RoundTrips_With_Null_Profile()
+    {
+        var cmd = new EpisodeResetCommand(null, "OPERATOR", "cli");
+
+        var copy = RoundTrip(cmd, out var json);
+
+        Assert.Contains("\"issued_by\":\"cli\"", json);
+        Assert.Null(copy.ProfileKey);
+        Assert.Equal("OPERATOR", copy.Reason);
+        Assert.Equal("cli", copy.IssuedBy);
+    }
 }

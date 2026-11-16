@@ -6,6 +6,7 @@ using QuantCore.Api.Services;
 using QuantCore.Contracts.Domain;
 using QuantCore.Contracts.Messaging;
 using RabbitMQ.Client;
+using QuantCore.Api.Endpoints;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -95,6 +96,8 @@ app.Map("/api/v1/stream/live", async (HttpContext ctx, MarketStreamGateway strea
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
     await stream.HandleDashboardClientAsync(ws, ct);
 });
+
+app.MapAgentEpisodeEndpoints();
 
 app.Run();
 

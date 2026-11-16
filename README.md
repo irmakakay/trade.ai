@@ -16,7 +16,13 @@ docker compose up --build
 - **Prometheus Metrics**: `http://localhost:8080/metrics`
 - **RabbitMQ Management**: `http://localhost:15672`
 
-## 3. LAN GPU Worker Offload (Optional)
+## 3. Agent Swarm & CLI Operator (Optional)
+```bash
+docker compose --profile agents up --build --scale quant-agents=3
+```
+See `src/QuantCore.Agents/README.md` for settlement modes and the `--mode cli` operator.
+
+## 4. LAN GPU Worker Offload (Optional)
 To run `nn-worker` on a secondary GPU machine over LAN while keeping Postgres, RabbitMQ, and `.NET Api` on the primary laptop:
 ```bash
 docker compose -f docker-compose.gpu-worker.yml up --build
