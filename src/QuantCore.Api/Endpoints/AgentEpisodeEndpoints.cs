@@ -137,6 +137,54 @@ public static class AgentEpisodeEndpoints
             return Results.Ok(new { broadcasted = true, cmd.Reason });
         });
 
+
+        app.MapGet("/api/v1/episodes/summary", async (Func<IDbConnection> dbFactory, CancellationToken ct) =>
+        {
+            using var conn = dbFactory();
+            conn.Open();
+
+            const string kpiSql = @"
+                SELECT
+                    COUNT(1) AS total_episodes,
+                    COALESCE(SUM(realized_pnl_usdt), 0) AS total_pnl_usdt,
+                    COALESCE(AVG(sharpe_estimate), 0) AS avg_sharpe,
+                    COALESCE(MAX(max_drawdown_pct), 0) AS worst_drawdown_pct
+                FROM trading_history;";
+
+            var kpis = await conn.QuerySingleAsync(new CommandDefinition(kpiSql, cancellationToken: ct));
+
+            const string recentEpisodesSql = @"
+                SELECT run_id, profile_key, replica_index, realized_pnl_usdt, max_drawdown_pct, sharpe_estimate, completed_at
+                FROM trading_history
+                ORDER BY completed_at DESC
+                LIMIT 15;";
+
+            var recentEpisodes = await conn.QueryAsync(new CommandDefinition(recentEpisodesSql, cancellationToken: ct));
+
+            const string nnCheckpointsSql = @"
+                SELECT model_id, version_tag, confidence_score, is_promoted_live, created_at
+                FROM nn_model_checkpoints
+                ORDER BY created_at DESC
+                LIMIT 8;";
+
+            var checkpoints = await conn.QueryAsync(new CommandDefinition(nnCheckpointsSql, cancellationToken: ct));
+
+            const string poolStateSql = @"
+                SELECT profile_key, replica_index, status, risk_dial_r
+                FROM strategy_pool
+                ORDER BY profile_key, replica_index;";
+
+            var poolState = await conn.QueryAsync(new CommandDefinition(poolStateSql, cancellationToken: ct));
+
+            return Results.Ok(new
+            {
+                kpis,
+                recent_episodes = recentEpisodes,
+                nn_checkpoints = checkpoints,
+                pool_state = poolState
+            });
+        });
+
         return app;
     }
 }

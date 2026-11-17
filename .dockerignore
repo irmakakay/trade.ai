@@ -1,0 +1,16 @@
+.git
+.github
+.vs
+.vscode
+**/node_modules
+**/dist
+**/bin
+**/obj
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+.venv
+venv
+*.zip
+*.log
