@@ -42,8 +42,8 @@ services:
 
   nn-worker:
     build:
-      context: ./src/quant_nn_worker
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: src/quant_nn_worker/Dockerfile
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
