@@ -9,43 +9,45 @@ namespace QuantCore.Api.Services;
 
 public sealed class MarketStreamGateway
 {
-    private readonly ConcurrentDictionary<Guid, Channel<LiveStreamFrame>> _clients = new();
+    private readonly ConcurrentDictionary<Guid, Channel<LiveStreamFrame>> _subscribers = new();
+    private readonly ConcurrentDictionary<string, decimal> _latestPrices = new();
 
-    // Fan-out: every connected client (dashboard and agents) receives every frame.
+    public IReadOnlyDictionary<string, decimal> LatestPrices => _latestPrices;
+
     public void PublishFrame(LiveStreamFrame frame)
     {
-        foreach (var channel in _clients.Values)
+        if (frame.EventType == "MARKET_TICK" && frame.Price > 0m)
         {
-            channel.Writer.TryWrite(frame);
+            _latestPrices[frame.Symbol] = frame.Price;
         }
-    }
 
-    public (ChannelReader<LiveStreamFrame> Reader, IDisposable Subscription) Subscribe()
-    {
-        var id = Guid.NewGuid();
-        // Slow clients drop their oldest frames instead of growing memory.
-        var channel = Channel.CreateBounded<LiveStreamFrame>(
-            new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true });
-        _clients[id] = channel;
-        return (channel.Reader, new Unsubscriber(() => _clients.TryRemove(id, out _)));
+        foreach (var (_, ch) in _subscribers)
+        {
+            ch.Writer.TryWrite(frame);
+        }
     }
 
     public async Task HandleDashboardClientAsync(WebSocket ws, CancellationToken ct)
     {
-        var (reader, subscription) = Subscribe();
-        using (subscription)
+        Guid subId = Guid.NewGuid();
+        var channel = Channel.CreateBounded<LiveStreamFrame>(new BoundedChannelOptions(512)
         {
-            await foreach (var frame in reader.ReadAllAsync(ct))
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+        _subscribers[subId] = channel;
+
+        try
+        {
+            await foreach (var frame in channel.Reader.ReadAllAsync(ct))
             {
                 if (ws.State != WebSocketState.Open) break;
                 var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(frame));
                 await ws.SendAsync(payload, WebSocketMessageType.Text, true, ct);
             }
         }
-    }
-
-    private sealed class Unsubscriber(Action onDispose) : IDisposable
-    {
-        public void Dispose() => onDispose();
+        finally
+        {
+            _subscribers.TryRemove(subId, out _);
+        }
     }
 }

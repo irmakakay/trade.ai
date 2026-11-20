@@ -6,7 +6,7 @@ import torch.nn as nn
 class DifferentiableNavSharpeLoss(nn.Module):
     """
     Optimizes future position NAV while penalizing drawdown and simulated crypto taker fees (10 bps).
-    Also calibrates the confidence_score head against actual positive trade outcomes.
+    Safe for both single-sample (B=1) and mini-batch (B=K) evolutionary updates.
     """
     def __init__(self, fee_rate: float = 0.0010, drawdown_weight: float = 2.0):
         super().__init__()
@@ -18,22 +18,27 @@ class DifferentiableNavSharpeLoss(nn.Module):
         self,
         model_out: Dict[str, torch.Tensor],
         future_returns: torch.Tensor,
+        target_confidence: torch.Tensor | None = None,
     ) -> torch.Tensor:
         probs = torch.softmax(model_out["action_logits"], dim=-1)
-        # Net directional exposure: P(BUY) - P(SELL) scaled by target slice
         signed_position = (probs[:, 0] - probs[:, 1]) * model_out["target_slice_pct"]
         turnover = (probs[:, 0] + probs[:, 1]) * model_out["target_slice_pct"]
 
         net_pnl = signed_position * future_returns - (turnover * self.fee_rate)
         mean_pnl = torch.mean(net_pnl)
-        std_pnl = torch.std(net_pnl, unbiased=False) + 1e-6
-        sharpe_proxy = mean_pnl / std_pnl
 
+        if net_pnl.numel() > 1:
+            std_pnl = torch.std(net_pnl, unbiased=False) + 1e-4
+        else:
+            std_pnl = torch.abs(mean_pnl).detach() + 1e-3
+
+        sharpe_proxy = mean_pnl / std_pnl
         downside = torch.relu(-net_pnl)
         drawdown_penalty = torch.mean(downside ** 2) * self.drawdown_weight
 
-        # Confidence calibration target: did the chosen directional sign make net profit?
-        profitable_target = (net_pnl.detach() > 0.0).float()
-        confidence_loss = self.bce(model_out["confidence_score"], profitable_target)
+        if target_confidence is None:
+            # Smoothly reward confidence when net_pnl is positive or improving
+            target_confidence = torch.clamp(torch.sigmoid(future_returns * 25.0 + 0.6), 0.15, 0.92).detach()
 
-        return -sharpe_proxy + drawdown_penalty + 0.25 * confidence_loss
+        confidence_loss = self.bce(model_out["confidence_score"], target_confidence)
+        return -sharpe_proxy + drawdown_penalty + 0.50 * confidence_loss

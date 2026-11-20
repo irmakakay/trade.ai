@@ -101,7 +101,7 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                     """,
                     (
                         str(uuid4()),
-                        f"{task.profile_key}_v2",
+                        f"{task.profile_key}_gen{result.get('generation', 1)}",
                         json.dumps({"hidden_dim": BRIDGE.model.hidden_dim}),
                         raw_bundle,
                         b"",
@@ -111,6 +111,12 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                     ),
                 )
         conn.commit()
+    print(
+        f"[NN-EVOLUTION] Profile={task.profile_key} | Gen={result.get('generation', 0)} | "
+        f"Winner=Replica#{result['winning_prior_replica']} | Loss={result.get('train_loss', 0.0):.4f} | "
+        f"Confidence={confidence*100:.1f}% | Promoted={result['is_promoted_for_live']}",
+        flush=True,
+    )
 
     return confidence, {
         "profile_key": task.profile_key,

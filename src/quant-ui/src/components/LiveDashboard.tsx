@@ -16,6 +16,7 @@ interface SummaryData {
     total_pnl_usdt: number;
     avg_sharpe: number;
     worst_drawdown_pct: number;
+    total_checkpoints?: number;
   };
   recent_episodes: Array<{
     run_id: string;
@@ -210,7 +211,7 @@ export const LiveDashboard: React.FC = () => {
         <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: "10px", padding: "12px" }}>
           <div style={{ fontSize: "11px", color: "#94a3b8", fontWeight: 600 }}>NN GENERATIONS TRAINED</div>
           <div style={{ fontSize: "18px", fontWeight: 700, marginTop: "4px", color: "#c084fc" }}>
-            {summary?.nn_checkpoints?.length ?? 0} Checkpoints
+            {kpis?.total_checkpoints ?? summary?.nn_checkpoints?.length ?? 0} Checkpoints
           </div>
         </div>
       </div>

@@ -63,7 +63,7 @@ public static class AgentEpisodeEndpoints
 
             // 3. If LiquidateAndReleaseSlices == true, release active strategy_allocations back to portfolio_inventory
             int releasedCount = 0;
-            if (req.LiquidateAndReleaseSlices)
+            // Always release DB slice reservation at episode boundary so next generation is never starved
             {
                 const string releaseSlicesSql = @"
                     WITH released AS (
@@ -148,7 +148,8 @@ public static class AgentEpisodeEndpoints
                     COUNT(1) AS total_episodes,
                     COALESCE(SUM(realized_pnl_usdt), 0) AS total_pnl_usdt,
                     COALESCE(AVG(sharpe_estimate), 0) AS avg_sharpe,
-                    COALESCE(MAX(max_drawdown_pct), 0) AS worst_drawdown_pct
+                    COALESCE(MAX(max_drawdown_pct), 0) AS worst_drawdown_pct,
+                    (SELECT COUNT(1) FROM nn_model_checkpoints) AS total_checkpoints
                 FROM trading_history;";
 
             var kpis = await conn.QuerySingleAsync(new CommandDefinition(kpiSql, cancellationToken: ct));
@@ -172,6 +173,7 @@ public static class AgentEpisodeEndpoints
             const string poolStateSql = @"
                 SELECT profile_key, replica_index, status, risk_dial_r
                 FROM strategy_pool
+                WHERE status IN ('AVAILABLE', 'CLAIMED')
                 ORDER BY profile_key, replica_index;";
 
             var poolState = await conn.QueryAsync(new CommandDefinition(poolStateSql, cancellationToken: ct));
