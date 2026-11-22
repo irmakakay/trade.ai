@@ -52,8 +52,12 @@ public sealed class BinanceMarketFeedHostedService : BackgroundService
                     var res = await ws.ReceiveAsync(buffer, stoppingToken);
                     if (res.MessageType == WebSocketMessageType.Close) break;
 
-                    if (TryParseBinanceKline(buffer.AsSpan(0, res.Count), out var frame))
+                    if (TryParseBinanceKlineWithOhlcv(buffer.AsSpan(0, res.Count), out var frame, out var candle))
                     {
+                        if (candle is not null)
+                        {
+                            _gateway.RecordOhlcvCandle(frame.Symbol, candle[0], candle[1], candle[2], candle[3], candle[4]);
+                        }
                         _gateway.PublishFrame(frame);
                     }
                 }
@@ -70,6 +74,38 @@ public sealed class BinanceMarketFeedHostedService : BackgroundService
                 await RunSyntheticGbmFeedAsync(fallbackCts.Token);
             }
         }
+    }
+
+
+    public static bool TryParseBinanceKlineWithOhlcv(
+        ReadOnlySpan<byte> utf8Json,
+        out LiveStreamFrame frame,
+        out double[]? ohlcv)
+    {
+        ohlcv = null;
+        if (!TryParseBinanceKline(utf8Json, out frame))
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(utf8Json.ToArray());
+            var root = doc.RootElement;
+            var payload = root.TryGetProperty("data", out var dataElem) ? dataElem : root;
+            if (payload.TryGetProperty("k", out var kline))
+            {
+                double c = (double)frame.Price;
+                double o = kline.TryGetProperty("o", out var op) && double.TryParse(op.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var ov) ? ov : c;
+                double h = kline.TryGetProperty("h", out var hp) && double.TryParse(hp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var hv) ? hv : Math.Max(o, c);
+                double l = kline.TryGetProperty("l", out var lp) && double.TryParse(lp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var lv) ? lv : Math.Min(o, c);
+                double v = kline.TryGetProperty("v", out var vp) && double.TryParse(vp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var vv) ? vv : 1.0;
+                ohlcv = new[] { o, h, l, c, v };
+            }
+        }
+        catch
+        {
+            // Keep frame even if optional OHLCV fields are absent
+        }
+        return true;
     }
 
     public static bool TryParseBinanceKline(ReadOnlySpan<byte> utf8Json, out LiveStreamFrame frame)

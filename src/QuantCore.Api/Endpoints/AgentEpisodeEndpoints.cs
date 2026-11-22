@@ -171,7 +171,7 @@ public static class AgentEpisodeEndpoints
             var checkpoints = await conn.QueryAsync(new CommandDefinition(nnCheckpointsSql, cancellationToken: ct));
 
             const string poolStateSql = @"
-                SELECT profile_key, replica_index, status, risk_dial_r
+                SELECT profile_key, replica_index, status, risk_dial_r, strategy_payload::text AS strategy_payload
                 FROM strategy_pool
                 WHERE status IN ('AVAILABLE', 'CLAIMED')
                 ORDER BY profile_key, replica_index;";
@@ -185,6 +185,12 @@ public static class AgentEpisodeEndpoints
                 nn_checkpoints = checkpoints,
                 pool_state = poolState
             });
+        });
+
+        app.MapGet("/api/v1/market/ohlcv-window", (int? limit, MarketStreamGateway stream) =>
+        {
+            var snapshot = stream.GetOhlcvSnapshot(limit ?? 32);
+            return Results.Ok(new { candles_by_symbol = snapshot });
         });
 
         return app;

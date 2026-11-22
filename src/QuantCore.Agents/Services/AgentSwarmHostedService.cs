@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using QuantCore.Agents.Client;
 using QuantCore.Agents.Settlement;
@@ -12,16 +13,33 @@ public sealed record ParsedStrategyParams(
     decimal MaxSliceClaimPct
 );
 
+public sealed record CarriedPositionState(
+    string Symbol,
+    decimal Quantity,
+    decimal EntryPrice
+);
+
 public sealed class AgentSwarmHostedService : BackgroundService
 {
     private const decimal TakerFeeRate = 0.0010m;
     private const decimal BaseAtrPct = 0.0080m; // 80 bps baseline volatility unit
+
+    private static readonly string[] AllProfiles =
+    {
+        "AGGRESSIVE_BREAKOUT",
+        "BALANCED_SWING",
+        "CAREFUL_MEAN_REVERSION"
+    };
 
     private readonly IQuantApiClient _apiClient;
     private readonly IPositionSettlementStrategy _settlementStrategy;
     private readonly IEpisodeCommandWatcher _commandWatcher;
     private readonly IConfiguration _config;
     private readonly ILogger<AgentSwarmHostedService> _logger;
+
+    // Tracks carried open positions across generations per (ProfileKey, Symbol) so agents
+    // do not pay repeated 10 bps entry taker fees when continuing an existing trend slice.
+    private readonly ConcurrentDictionary<string, CarriedPositionState> _carriedPositions = new();
 
     public AgentSwarmHostedService(
         IQuantApiClient apiClient,
@@ -39,17 +57,44 @@ public sealed class AgentSwarmHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        string profileKey = _config["AGENT_PROFILE_KEY"] ?? "AGGRESSIVE_BREAKOUT";
-        int maxTicksPerEpisode = _config.GetValue<int>("EPISODE_MAX_TICKS", 100);
+        string configuredProfile = (_config["AGENT_PROFILE_KEY"] ?? "ALL").Trim().ToUpperInvariant();
+        string[] targetProfiles = configuredProfile == "ALL"
+            ? AllProfiles
+            : configuredProfile.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (targetProfiles.Length == 0)
+        {
+            targetProfiles = AllProfiles;
+        }
+
+        int maxTicksPerEpisode = _config.GetValue<int>("EPISODE_MAX_TICKS", 40);
         int maxEpisodeSeconds = _config.GetValue<int>("EPISODE_MAX_SECONDS", 300);
         Guid agentId = Guid.NewGuid();
+        int profileCursor = Random.Shared.Next(targetProfiles.Length);
+
+        _logger.LogInformation(
+            "[Agent {AgentId}] Started swarm worker | Profiles=[{Profiles}] | Mode={Mode} | MaxTicks={Ticks}",
+            agentId, string.Join(",", targetProfiles), _settlementStrategy.StrategyName, maxTicksPerEpisode);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            var slot = await _apiClient.CheckoutStrategySlotAsync(agentId, profileKey, stoppingToken);
+            PoolSlotDto? slot = null;
+
+            // Round-robin across configured profiles so all strategy pools evolve concurrently
+            for (int attempt = 0; attempt < targetProfiles.Length; attempt++)
+            {
+                string candidateProfile = targetProfiles[(profileCursor + attempt) % targetProfiles.Length];
+                slot = await _apiClient.CheckoutStrategySlotAsync(agentId, candidateProfile, stoppingToken);
+                if (slot is not null)
+                {
+                    profileCursor = (profileCursor + attempt + 1) % targetProfiles.Length;
+                    break;
+                }
+            }
+
             if (slot is null)
             {
-                await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
+                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
                 continue;
             }
 
@@ -67,6 +112,8 @@ public sealed class AgentSwarmHostedService : BackgroundService
         var candidateSymbols = JsonSerializer.Deserialize<List<string>>(slot.CandidateSymbolsJson)
             ?? new List<string> { "SOLUSDT" };
         var strat = ParseStrategyPayload(slot.StrategyPayloadJson);
+
+        bool isCarryMode = _settlementStrategy.StrategyName.Equals("CARRY_POSITIONS", StringComparison.OrdinalIgnoreCase);
 
         var openQuantities = new Dictionary<string, decimal>();
         var entryPrices = new Dictionary<string, decimal>();
@@ -101,36 +148,78 @@ public sealed class AgentSwarmHostedService : BackgroundService
                 latestPrices[tick.Symbol] = tick.Price;
                 ticksProcessed++;
 
-                // 1. Entry Claim: If we haven't claimed a slice yet and this tick matches a candidate symbol
+                // 1. Entry or Carried Position Adoption
                 if (openQuantities.Count == 0 && entryPrices.Count == 0 && candidateSymbols.Contains(tick.Symbol))
                 {
-                    var claim = await _apiClient.ClaimSymbolSliceAsync(
-                        new ShareSliceClaimRequest(
-                            agentId,
-                            slot.PoolInstanceId,
-                            tick.Symbol,
-                            strat.MaxSliceClaimPct,
-                            "LONG_ACCUMULATING"),
-                        linkedCts.Token);
+                    string carryKey = $"{slot.ProfileKey}:{tick.Symbol}";
 
-                    if (claim is { Claimed: true, ReservedQuantity: > 0m })
+                    if (isCarryMode && _carriedPositions.TryRemove(carryKey, out var carried) && carried.Quantity > 0m)
                     {
-                        decimal entryFee = Math.Round(claim.ReservedQuantity * tick.Price * TakerFeeRate, 8);
-                        openQuantities[tick.Symbol] = claim.ReservedQuantity;
-                        entryPrices[tick.Symbol] = tick.Price;
-                        realizedPnlUsdt -= entryFee;
+                        // Re-lock slice in API mutex without paying a duplicate 10 bps entry taker fee
+                        var claim = await _apiClient.ClaimSymbolSliceAsync(
+                            new ShareSliceClaimRequest(
+                                agentId,
+                                slot.PoolInstanceId,
+                                tick.Symbol,
+                                strat.MaxSliceClaimPct,
+                                "LONG_ACCUMULATING"),
+                            linkedCts.Token);
 
-                        initialNotionalUsdt = claim.ReservedQuantity * tick.Price;
-                        peakEquityUsdt = initialNotionalUsdt - entryFee;
+                        decimal activeQty = (claim is { Claimed: true, ReservedQuantity: > 0m })
+                            ? claim.ReservedQuantity
+                            : carried.Quantity;
+
+                        // Only charge taker fee on net incremental quantity added above the carried position
+                        decimal incrementalQty = Math.Max(0m, activeQty - carried.Quantity);
+                        decimal deltaFee = Math.Round(incrementalQty * tick.Price * TakerFeeRate, 8);
+
+                        // Mark-to-market baseline from current tick price for this episode's delta PnL
+                        openQuantities[tick.Symbol] = activeQty;
+                        entryPrices[tick.Symbol] = tick.Price;
+                        realizedPnlUsdt -= deltaFee;
+
+                        initialNotionalUsdt = activeQty * tick.Price;
+                        peakEquityUsdt = initialNotionalUsdt - deltaFee;
                         prevEquityUsdt = peakEquityUsdt;
 
                         moves.Add(new ExecutedMoveRecord(
                             tick.Symbol,
-                            "BUY_SLICE_CLAIM",
-                            claim.ReservedQuantity,
+                            "CARRY_INHERIT_SLICE",
+                            activeQty,
                             tick.Price,
-                            entryFee,
+                            deltaFee,
                             tick.TimestampMs));
+                    }
+                    else
+                    {
+                        var claim = await _apiClient.ClaimSymbolSliceAsync(
+                            new ShareSliceClaimRequest(
+                                agentId,
+                                slot.PoolInstanceId,
+                                tick.Symbol,
+                                strat.MaxSliceClaimPct,
+                                "LONG_ACCUMULATING"),
+                            linkedCts.Token);
+
+                        if (claim is { Claimed: true, ReservedQuantity: > 0m })
+                        {
+                            decimal entryFee = Math.Round(claim.ReservedQuantity * tick.Price * TakerFeeRate, 8);
+                            openQuantities[tick.Symbol] = claim.ReservedQuantity;
+                            entryPrices[tick.Symbol] = tick.Price;
+                            realizedPnlUsdt -= entryFee;
+
+                            initialNotionalUsdt = claim.ReservedQuantity * tick.Price;
+                            peakEquityUsdt = initialNotionalUsdt - entryFee;
+                            prevEquityUsdt = peakEquityUsdt;
+
+                            moves.Add(new ExecutedMoveRecord(
+                                tick.Symbol,
+                                "BUY_SLICE_CLAIM",
+                                claim.ReservedQuantity,
+                                tick.Price,
+                                entryFee,
+                                tick.TimestampMs));
+                        }
                     }
                     continue;
                 }
@@ -195,12 +284,17 @@ public sealed class AgentSwarmHostedService : BackgroundService
             _logger.LogInformation("[Agent {AgentId}] Episode interrupted by Precedence Reset or Time Window.", agentId);
         }
 
-        // If position is still open at episode end, include unrealized PnL in baseline before settlement strategy runs
+        // Evaluate open positions at episode boundary
         foreach (var (sym, qty) in openQuantities)
         {
             if (qty > 0m && latestPrices.TryGetValue(sym, out decimal lastP) && entryPrices.TryGetValue(sym, out decimal entP))
             {
                 realizedPnlUsdt += qty * (lastP - entP);
+
+                if (isCarryMode)
+                {
+                    _carriedPositions[$"{slot.ProfileKey}:{sym}"] = new CarriedPositionState(sym, qty, lastP);
+                }
             }
         }
 
@@ -249,7 +343,6 @@ public sealed class AgentSwarmHostedService : BackgroundService
         double variance = m2 / (count - 1);
         double stdDev = Math.Sqrt(Math.Max(variance, 1e-12));
         if (stdDev <= 1e-9) return 0m;
-        // Scale step Sharpe by sqrt(N) capped to [-10, 10]
         double rawSharpe = (mean / stdDev) * Math.Sqrt(count);
         return Math.Round((decimal)Math.Clamp(rawSharpe, -10.0, 10.0), 4);
     }

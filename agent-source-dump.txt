@@ -1,0 +1,469 @@
+=================================================================
+FILE: src/QuantCore.Agents/Services/AgentSwarmHostedService.cs
+=================================================================
+using System.Text.Json;
+using QuantCore.Agents.Client;
+using QuantCore.Agents.Settlement;
+using QuantCore.Contracts.Domain;
+
+namespace QuantCore.Agents.Services;
+
+public sealed record ParsedStrategyParams(
+    decimal EntryThreshold,
+    decimal StopLossAtr,
+    decimal TakeProfitRr,
+    decimal MaxSliceClaimPct
+);
+
+public sealed class AgentSwarmHostedService : BackgroundService
+{
+    private const decimal TakerFeeRate = 0.0010m;
+    private const decimal BaseAtrPct = 0.0080m; // 80 bps baseline volatility unit
+
+    private readonly IQuantApiClient _apiClient;
+    private readonly IPositionSettlementStrategy _settlementStrategy;
+    private readonly IEpisodeCommandWatcher _commandWatcher;
+    private readonly IConfiguration _config;
+    private readonly ILogger<AgentSwarmHostedService> _logger;
+
+    public AgentSwarmHostedService(
+        IQuantApiClient apiClient,
+        IPositionSettlementStrategy settlementStrategy,
+        IEpisodeCommandWatcher commandWatcher,
+        IConfiguration config,
+        ILogger<AgentSwarmHostedService> logger)
+    {
+        _apiClient = apiClient;
+        _settlementStrategy = settlementStrategy;
+        _commandWatcher = commandWatcher;
+        _config = config;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        string profileKey = _config["AGENT_PROFILE_KEY"] ?? "AGGRESSIVE_BREAKOUT";
+        int maxTicksPerEpisode = _config.GetValue<int>("EPISODE_MAX_TICKS", 100);
+        int maxEpisodeSeconds = _config.GetValue<int>("EPISODE_MAX_SECONDS", 300);
+        Guid agentId = Guid.NewGuid();
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var slot = await _apiClient.CheckoutStrategySlotAsync(agentId, profileKey, stoppingToken);
+            if (slot is null)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
+                continue;
+            }
+
+            await RunSingleEpisodeAsync(agentId, slot, maxTicksPerEpisode, maxEpisodeSeconds, stoppingToken);
+        }
+    }
+
+    public async Task<EpisodeCommitResponse?> RunSingleEpisodeAsync(
+        Guid agentId,
+        PoolSlotDto slot,
+        int maxTicks,
+        int maxSeconds,
+        CancellationToken stoppingToken)
+    {
+        var candidateSymbols = JsonSerializer.Deserialize<List<string>>(slot.CandidateSymbolsJson)
+            ?? new List<string> { "SOLUSDT" };
+        var strat = ParseStrategyPayload(slot.StrategyPayloadJson);
+
+        var openQuantities = new Dictionary<string, decimal>();
+        var entryPrices = new Dictionary<string, decimal>();
+        var latestPrices = new Dictionary<string, decimal>();
+        var moves = new List<ExecutedMoveRecord>();
+
+        using var durationCts = new CancellationTokenSource(TimeSpan.FromSeconds(maxSeconds));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            stoppingToken,
+            durationCts.Token,
+            _commandWatcher.CurrentEpisodeResetToken);
+
+        int ticksProcessed = 0;
+        decimal realizedPnlUsdt = 0m;
+        decimal initialNotionalUsdt = 0m;
+        decimal peakEquityUsdt = 0m;
+        decimal prevEquityUsdt = 0m;
+        decimal maxDrawdownPct = 0m;
+
+        // Welford online variance accumulators for tick-by-tick returns
+        int returnCount = 0;
+        double meanReturn = 0.0;
+        double m2Return = 0.0;
+
+        try
+        {
+            while (ticksProcessed < maxTicks && !linkedCts.Token.IsCancellationRequested)
+            {
+                var tick = await _commandWatcher.MarketTicksReader.ReadAsync(linkedCts.Token);
+                if (tick.Price <= 0m) continue;
+
+                latestPrices[tick.Symbol] = tick.Price;
+                ticksProcessed++;
+
+                // 1. Entry Claim: If we haven't claimed a slice yet and this tick matches a candidate symbol
+                if (openQuantities.Count == 0 && entryPrices.Count == 0 && candidateSymbols.Contains(tick.Symbol))
+                {
+                    var claim = await _apiClient.ClaimSymbolSliceAsync(
+                        new ShareSliceClaimRequest(
+                            agentId,
+                            slot.PoolInstanceId,
+                            tick.Symbol,
+                            strat.MaxSliceClaimPct,
+                            "LONG_ACCUMULATING"),
+                        linkedCts.Token);
+
+                    if (claim is { Claimed: true, ReservedQuantity: > 0m })
+                    {
+                        decimal entryFee = Math.Round(claim.ReservedQuantity * tick.Price * TakerFeeRate, 8);
+                        openQuantities[tick.Symbol] = claim.ReservedQuantity;
+                        entryPrices[tick.Symbol] = tick.Price;
+                        realizedPnlUsdt -= entryFee;
+
+                        initialNotionalUsdt = claim.ReservedQuantity * tick.Price;
+                        peakEquityUsdt = initialNotionalUsdt - entryFee;
+                        prevEquityUsdt = peakEquityUsdt;
+
+                        moves.Add(new ExecutedMoveRecord(
+                            tick.Symbol,
+                            "BUY_SLICE_CLAIM",
+                            claim.ReservedQuantity,
+                            tick.Price,
+                            entryFee,
+                            tick.TimestampMs));
+                    }
+                    continue;
+                }
+
+                // 2. Mark-to-Market Valuation, Stop-Loss / Take-Profit Check & Online Sharpe Update
+                if (openQuantities.TryGetValue(tick.Symbol, out decimal heldQty) && heldQty > 0m)
+                {
+                    decimal entryPrice = entryPrices[tick.Symbol];
+                    decimal priceReturnPct = (tick.Price - entryPrice) / entryPrice;
+
+                    decimal stopLossPct = -strat.StopLossAtr * BaseAtrPct;
+                    decimal takeProfitPct = strat.StopLossAtr * BaseAtrPct * strat.TakeProfitRr;
+
+                    decimal currentPositionValue = heldQty * tick.Price;
+                    decimal currentEquity = initialNotionalUsdt + realizedPnlUsdt + (heldQty * (tick.Price - entryPrice));
+
+                    if (prevEquityUsdt > 0m)
+                    {
+                        double stepRet = (double)((currentEquity - prevEquityUsdt) / prevEquityUsdt);
+                        returnCount++;
+                        double delta = stepRet - meanReturn;
+                        meanReturn += delta / returnCount;
+                        double delta2 = stepRet - meanReturn;
+                        m2Return += delta * delta2;
+                    }
+                    prevEquityUsdt = currentEquity;
+
+                    if (currentEquity > peakEquityUsdt)
+                    {
+                        peakEquityUsdt = currentEquity;
+                    }
+                    else if (peakEquityUsdt > 0m)
+                    {
+                        decimal dd = (peakEquityUsdt - currentEquity) / peakEquityUsdt;
+                        if (dd > maxDrawdownPct) maxDrawdownPct = Math.Round(dd, 4);
+                    }
+
+                    // Dynamic Stop-Loss or Take-Profit Exit
+                    if (priceReturnPct <= stopLossPct || priceReturnPct >= takeProfitPct)
+                    {
+                        string exitAction = priceReturnPct >= takeProfitPct ? "SELL_TAKE_PROFIT" : "SELL_STOP_LOSS";
+                        decimal exitFee = Math.Round(currentPositionValue * TakerFeeRate, 8);
+                        decimal tradeGrossPnl = heldQty * (tick.Price - entryPrice);
+
+                        realizedPnlUsdt += tradeGrossPnl - exitFee;
+                        openQuantities[tick.Symbol] = 0m;
+
+                        moves.Add(new ExecutedMoveRecord(
+                            tick.Symbol,
+                            exitAction,
+                            heldQty,
+                            tick.Price,
+                            exitFee,
+                            tick.TimestampMs));
+                        break; // Position closed; settle episode immediately
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("[Agent {AgentId}] Episode interrupted by Precedence Reset or Time Window.", agentId);
+        }
+
+        // If position is still open at episode end, include unrealized PnL in baseline before settlement strategy runs
+        foreach (var (sym, qty) in openQuantities)
+        {
+            if (qty > 0m && latestPrices.TryGetValue(sym, out decimal lastP) && entryPrices.TryGetValue(sym, out decimal entP))
+            {
+                realizedPnlUsdt += qty * (lastP - entP);
+            }
+        }
+
+        decimal sharpeEstimate = ComputeAnnualizedSharpe(returnCount, meanReturn, m2Return);
+
+        var context = new ActiveAgentContext(
+            RunId: Guid.NewGuid(),
+            PoolInstanceId: slot.PoolInstanceId,
+            AgentId: agentId,
+            ActorType: "AGENT",
+            ProfileKey: slot.ProfileKey,
+            ReplicaIndex: slot.ReplicaIndex,
+            JitterDeltaJson: slot.JitterDeltaJson,
+            ExecutedMoves: moves,
+            RealizedPnlUsdt: Math.Round(realizedPnlUsdt, 8),
+            MaxDrawdownPct: Math.Round(maxDrawdownPct, 4),
+            SharpeEstimate: sharpeEstimate,
+            OpenSymbolQuantities: openQuantities,
+            LatestMarketPrices: latestPrices
+        );
+
+        return await _settlementStrategy.SettleEpisodeAsync(context, stoppingToken);
+    }
+
+    public static ParsedStrategyParams ParseStrategyPayload(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            decimal entry = root.TryGetProperty("entry_threshold", out var e) ? e.GetDecimal() : 0.60m;
+            decimal sl = root.TryGetProperty("stop_loss_atr", out var s) ? s.GetDecimal() : 1.50m;
+            decimal tp = root.TryGetProperty("take_profit_rr", out var t) ? t.GetDecimal() : 2.00m;
+            decimal slice = root.TryGetProperty("max_slice_claim_pct", out var m) ? m.GetDecimal() : 0.25m;
+            return new ParsedStrategyParams(entry, sl, tp, Math.Clamp(slice, 0.01m, 1.0m));
+        }
+        catch
+        {
+            return new ParsedStrategyParams(0.60m, 1.50m, 2.00m, 0.25m);
+        }
+    }
+
+    public static decimal ComputeAnnualizedSharpe(int count, double mean, double m2)
+    {
+        if (count < 2) return 0m;
+        double variance = m2 / (count - 1);
+        double stdDev = Math.Sqrt(Math.Max(variance, 1e-12));
+        if (stdDev <= 1e-9) return 0m;
+        // Scale step Sharpe by sqrt(N) capped to [-10, 10]
+        double rawSharpe = (mean / stdDev) * Math.Sqrt(count);
+        return Math.Round((decimal)Math.Clamp(rawSharpe, -10.0, 10.0), 4);
+    }
+}
+
+=================================================================
+FILE: src/QuantCore.Agents/Services/QuantApiClient.cs
+=================================================================
+[MISSING]: src/QuantCore.Agents/Services/QuantApiClient.cs
+
+
+=================================================================
+FILE: src/QuantCore.Agents/Settlement/CarryPositionsStrategy.cs
+=================================================================
+using QuantCore.Agents.Client;
+using QuantCore.Contracts.Domain;
+
+namespace QuantCore.Agents.Settlement;
+
+public sealed class CarryPositionsStrategy : IPositionSettlementStrategy
+{
+    private readonly IQuantApiClient _apiClient;
+
+    public string StrategyName => "CARRY_POSITIONS";
+
+    public CarryPositionsStrategy(IQuantApiClient apiClient)
+    {
+        _apiClient = apiClient;
+    }
+
+    public async Task<EpisodeCommitResponse?> SettleEpisodeAsync(ActiveAgentContext context, CancellationToken ct)
+    {
+        var commitReq = new EpisodeCommitRequest(
+            RunId: context.RunId,
+            PoolInstanceId: context.PoolInstanceId,
+            IdentityId: context.AgentId,
+            ActorType: context.ActorType,
+            ProfileKey: context.ProfileKey,
+            ReplicaIndex: context.ReplicaIndex,
+            JitterDeltaJson: context.JitterDeltaJson,
+            ExecutedMoves: context.ExecutedMoves,
+            RealizedPnlUsdt: context.RealizedPnlUsdt,
+            MaxDrawdownPct: context.MaxDrawdownPct,
+            SharpeEstimate: context.SharpeEstimate,
+            LiquidateAndReleaseSlices: false
+        );
+
+        return await _apiClient.CommitEpisodeHistoryAsync(commitReq, ct);
+    }
+}
+
+
+=================================================================
+FILE: src/QuantCore.Agents/Program.cs
+=================================================================
+using QuantCore.Agents.Cli;
+using QuantCore.Agents.Client;
+using QuantCore.Agents.Services;
+using QuantCore.Agents.Settlement;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+string apiBaseUrl = builder.Configuration["QUANT_API_URL"] ?? "http://localhost:8080";
+builder.Services.AddHttpClient<IQuantApiClient, QuantApiClient>(client =>
+{
+    client.BaseAddress = new Uri(apiBaseUrl);
+});
+
+// Inject IPositionSettlementStrategy strictly via deployment environment variable
+string settlementMode = (builder.Configuration["EPISODE_SETTLEMENT_MODE"] ?? "LIQUIDATE_AND_RELEASE")
+    .Trim()
+    .ToUpperInvariant();
+
+if (settlementMode == "CARRY_POSITIONS")
+{
+    builder.Services.AddSingleton<IPositionSettlementStrategy, CarryPositionsStrategy>();
+}
+else
+{
+    builder.Services.AddSingleton<IPositionSettlementStrategy, LiquidateAndReleaseStrategy>();
+}
+
+// Parse --mode switch (default: agent)
+string executionMode = "agent";
+for (int i = 0; i < args.Length; i++)
+{
+    if (args[i].Equals("--mode", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+    {
+        executionMode = args[i + 1].Trim().ToLowerInvariant();
+    }
+}
+
+if (executionMode == "cli")
+{
+    builder.Services.AddSingleton<InteractiveCliRunner>();
+    using var host = builder.Build();
+    var cli = host.Services.GetRequiredService<InteractiveCliRunner>();
+    await cli.RunInteractiveLoopAsync(CancellationToken.None);
+}
+else
+{
+    builder.Services.AddSingleton<EpisodeCommandWatcher>();
+    builder.Services.AddSingleton<IEpisodeCommandWatcher>(sp => sp.GetRequiredService<EpisodeCommandWatcher>());
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<EpisodeCommandWatcher>());
+    builder.Services.AddHostedService<AgentSwarmHostedService>();
+
+    using var host = builder.Build();
+    await host.RunAsync();
+}
+
+
+=================================================================
+FILE: docker-compose.yml
+=================================================================
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quant} -d ${POSTGRES_DB:-quantcore}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrations:
+    build:
+      context: ./migrations
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  nn-worker:
+    build:
+      context: .
+      dockerfile: src/quant_nn_worker/Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-quantcore}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant_secret}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      POOL_REPLICATION_FACTOR: ${POOL_REPLICATION_FACTOR:-3}
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.75}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  quant-api:
+    build:
+      context: .
+      dockerfile: src/QuantCore.Api/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      POSTGRES_CONNECTION: Host=postgres;Port=5432;Database=${POSTGRES_DB:-quantcore};Username=${POSTGRES_USER:-quant};Password=${POSTGRES_PASSWORD:-quant_secret}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      POOL_REPLICATION_FACTOR: ${POOL_REPLICATION_FACTOR:-3}
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.75}
+      LOCK_TTL_SECONDS: ${LOCK_TTL_SECONDS:-5}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # Opt-in so agents don't consume pool slots during verify-local.sh: docker compose --profile agents up --scale quant-agents=3
+  quant-agents:
+    profiles: ["agents"]
+    build:
+      context: .
+      dockerfile: src/QuantCore.Agents/Dockerfile
+    command: ["--mode", "agent"]
+    environment:
+      QUANT_API_URL: http://quant-api:8080
+      QUANT_API_WS_URL: ws://quant-api:8080/api/v1/stream/live
+      AGENT_PROFILE_KEY: ${AGENT_PROFILE_KEY:-AGGRESSIVE_BREAKOUT}
+      EPISODE_SETTLEMENT_MODE: ${EPISODE_SETTLEMENT_MODE:-LIQUIDATE_AND_RELEASE}
+      EPISODE_MAX_TICKS: ${EPISODE_MAX_TICKS:-100}
+      EPISODE_MAX_SECONDS: ${EPISODE_MAX_SECONDS:-300}
+    depends_on:
+      quant-api:
+        condition: service_started
+

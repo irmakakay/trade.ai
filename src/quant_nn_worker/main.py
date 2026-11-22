@@ -1,6 +1,10 @@
 import json
 import os
+from urllib.error import URLError
+from urllib.request import urlopen
 from uuid import uuid4
+
+import numpy as np
 import pika
 import psycopg
 from psycopg.rows import dict_row
@@ -10,6 +14,7 @@ from adapter.schemas import InputTaskMessage, TaskCommandType
 from quant_nn_engine import BrainStateCodec, QuantBrainBridge, ReplicaHistoryRecord
 
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
+QUANT_API_URL = os.getenv("QUANT_API_URL", "http://quant-api:8080").rstrip("/")
 BRIDGE = QuantBrainBridge(confidence_threshold=CONFIDENCE_THRESHOLD, hidden_dim=64)
 
 
@@ -21,6 +26,51 @@ def get_pg_conn_str() -> str:
         f"user={os.getenv('POSTGRES_USER', 'quant')} "
         f"password={os.getenv('POSTGRES_PASSWORD', 'quant_secret')}"
     )
+
+
+def try_restore_latest_checkpoint() -> None:
+    try:
+        with psycopg.connect(get_pg_conn_str(), row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT version_tag, weights_blob, confidence_score, is_promoted_live
+                    FROM nn_model_checkpoints
+                    WHERE weights_blob IS NOT NULL AND octet_length(weights_blob) > 0
+                    ORDER BY is_promoted_live DESC, confidence_score DESC, created_at DESC
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+                if not row:
+                    return
+                raw_blob = bytes(row["weights_blob"])
+                meta = BrainStateCodec.load_state_bundle(raw_blob, BRIDGE.model, BRIDGE.optimizer)
+                print(
+                    f"[quant_nn_worker] Restored checkpoint '{row['version_tag']}' "
+                    f"(conf={float(row['confidence_score'])*100:.1f}%, promoted={row['is_promoted_live']}, meta={meta})",
+                    flush=True,
+                )
+    except Exception as exc:
+        print(f"[quant_nn_worker] Checkpoint auto-load skipped ({exc})", flush=True)
+
+
+def fetch_live_ohlcv_window(candidate_symbols: list[str], limit: int = 32) -> dict[str, np.ndarray]:
+    ohlcv_map: dict[str, np.ndarray] = {}
+    url = f"{QUANT_API_URL}/api/v1/market/ohlcv-window?limit={limit}"
+    try:
+        with urlopen(url, timeout=2.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        candles_by_sym = payload.get("candles_by_symbol") or {}
+        for sym in candidate_symbols:
+            rows = candles_by_sym.get(sym)
+            if rows and len(rows) >= 4:
+                arr = np.asarray(rows, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] == 5:
+                    ohlcv_map[sym] = arr
+    except (URLError, TimeoutError, ValueError, OSError):
+        pass
+    return ohlcv_map
 
 
 def fetch_latest_generation_histories(cur, profile_key: str, limit: int) -> list[ReplicaHistoryRecord]:
@@ -48,6 +98,8 @@ def fetch_latest_generation_histories(cur, profile_key: str, limit: int) -> list
 
 
 def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
+    ohlcv_by_symbol = fetch_live_ohlcv_window(task.candidate_symbols, limit=32)
+
     with psycopg.connect(get_pg_conn_str(), row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             prior_histories = fetch_latest_generation_histories(
@@ -59,11 +111,11 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                 risk_dial_r=task.risk_dial_r,
                 candidate_symbols=task.candidate_symbols,
                 replication_factor=task.replication_factor,
+                ohlcv_by_symbol=ohlcv_by_symbol if ohlcv_by_symbol else None,
                 prior_histories=prior_histories,
             )
 
             if task.command == TaskCommandType.RECALCULATE_POOL:
-                # Clear stale AVAILABLE slots for this profile before inserting the new generation
                 cur.execute(
                     "DELETE FROM strategy_pool WHERE profile_key = %s AND status = 'AVAILABLE';",
                     (task.profile_key,),
@@ -86,11 +138,10 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                         ),
                     )
 
-                # Persist BYTEA model checkpoint
                 raw_bundle = BrainStateCodec.dump_state_bundle(
                     BRIDGE.model,
                     BRIDGE.optimizer,
-                    {"profile_key": task.profile_key},
+                    {"profile_key": task.profile_key, "ohlcv_symbols": list(ohlcv_by_symbol.keys())},
                     confidence,
                 )
                 cur.execute(
@@ -111,8 +162,10 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                     ),
                 )
         conn.commit()
+
     print(
         f"[NN-EVOLUTION] Profile={task.profile_key} | Gen={result.get('generation', 0)} | "
+        f"OHLCV_Syms={len(ohlcv_by_symbol)}/{len(task.candidate_symbols)} | "
         f"Winner=Replica#{result['winning_prior_replica']} | Loss={result.get('train_loss', 0.0):.4f} | "
         f"Confidence={confidence*100:.1f}% | Promoted={result['is_promoted_for_live']}",
         flush=True,
@@ -127,6 +180,8 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
 
 
 def main() -> None:
+    try_restore_latest_checkpoint()
+
     rmq_host = os.getenv("RABBITMQ_HOST", "localhost")
     rmq_port = int(os.getenv("RABBITMQ_PORT", "5672"))
     params = pika.ConnectionParameters(host=rmq_host, port=rmq_port)

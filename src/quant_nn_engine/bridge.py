@@ -26,6 +26,7 @@ class QuantBrainBridge:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=4e-3, weight_decay=1e-4)
         self.loss_fn = DifferentiableNavSharpeLoss()
         self.generation_count: int = 0
+        self.generation_by_profile: Dict[str, int] = {}
 
     def train_step_on_candles(
         self,
@@ -53,6 +54,7 @@ class QuantBrainBridge:
         self,
         histories: List[ReplicaHistoryRecord],
         risk_dial_r: float,
+        profile_key: str = "DEFAULT",
         epochs: int = 6,
     ) -> float:
         """
@@ -64,6 +66,8 @@ class QuantBrainBridge:
 
         self.model.train()
         self.generation_count += 1
+        gen_num = self.generation_by_profile.get(profile_key, 0) + 1
+        self.generation_by_profile[profile_key] = gen_num
         batch_size = len(histories)
 
         # Build informative state tensors encoding each replica's empirical metrics
@@ -95,7 +99,7 @@ class QuantBrainBridge:
             returns_list.append(eff_ret)
 
             # Progressive confidence curriculum as generations accumulate + positive Sharpe
-            maturity_bonus = min(0.32, self.generation_count * 0.065)
+            maturity_bonus = min(0.28, gen_num * 0.055)
             sharpe_bonus = max(0.0, min(0.15, h.sharpe_estimate * 0.06))
             conf_targets.append(min(0.92, 0.52 + maturity_bonus + sharpe_bonus))
 
@@ -129,7 +133,7 @@ class QuantBrainBridge:
         # 1. If prior generation histories exist, run online PyTorch training first!
         train_loss = 0.0
         if prior_histories:
-            train_loss = self.train_on_generation_histories(prior_histories, risk_dial_r)
+            train_loss = self.train_on_generation_histories(prior_histories, risk_dial_r, profile_key=profile_key)
 
         # 2. Switch to eval mode to synthesize updated strategy parameters & confidence
         self.model.eval()
@@ -193,7 +197,16 @@ class QuantBrainBridge:
             profile_key=profile_key,
             risk_dial_r=risk_dial_r,
             confidence_score=confidence,
-            is_promoted_for_live=confidence >= self.confidence_threshold,
+            is_promoted_for_live=(
+                confidence >= self.confidence_threshold
+                and (
+                    not prior_histories
+                    or (
+                        (sum(h.sharpe_estimate for h in prior_histories) / len(prior_histories)) >= 0.0
+                        and max(h.sharpe_estimate for h in prior_histories) > 0.20
+                    )
+                )
+            ),
             strategy_params=StrategyHyperparams(**avg_base),
             ranked_symbols=ranked_symbols,
             asset_forecasts=asset_forecasts,
@@ -201,7 +214,7 @@ class QuantBrainBridge:
 
         return confidence, {
             "profile_key": profile_key,
-            "generation": self.generation_count,
+            "generation": self.generation_by_profile.get(profile_key, self.generation_count),
             "train_loss": round(train_loss, 4),
             "winning_prior_replica": winner_replica,
             "is_promoted_for_live": forecast_pkg.is_promoted_for_live,
