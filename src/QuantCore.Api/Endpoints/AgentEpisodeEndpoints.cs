@@ -102,11 +102,17 @@ public static class AgentEpisodeEndpoints
             if (remaining == 0)
             {
                 int kFactor = cfg.GetValue<int>("POOL_REPLICATION_FACTOR", 3);
+                decimal profileRiskDial = req.ProfileKey.Trim().ToUpperInvariant() switch
+                {
+                    "CAREFUL_MEAN_REVERSION" => 0.25m,
+                    "BALANCED_SWING" => 0.50m,
+                    _ => 0.75m
+                };
                 mq.SubmitTaskToInputQueue(new InputTaskMessage(
                     Guid.NewGuid(),
                     TaskCommandType.RECALCULATE_POOL,
                     req.ProfileKey,
-                    0.75m,
+                    profileRiskDial,
                     kFactor,
                     new[] { "BTCUSDT", "ETHUSDT", "SOLUSDT" },
                     DateTimeOffset.UtcNow
@@ -171,10 +177,11 @@ public static class AgentEpisodeEndpoints
             var checkpoints = await conn.QueryAsync(new CommandDefinition(nnCheckpointsSql, cancellationToken: ct));
 
             const string poolStateSql = @"
-                SELECT profile_key, replica_index, status, risk_dial_r, strategy_payload::text AS strategy_payload
+                SELECT DISTINCT ON (profile_key, replica_index)
+                    profile_key, replica_index, status, risk_dial_r, strategy_payload::text AS strategy_payload
                 FROM strategy_pool
                 WHERE status IN ('AVAILABLE', 'CLAIMED')
-                ORDER BY profile_key, replica_index;";
+                ORDER BY profile_key, replica_index, created_at DESC;";
 
             var poolState = await conn.QueryAsync(new CommandDefinition(poolStateSql, cancellationToken: ct));
 

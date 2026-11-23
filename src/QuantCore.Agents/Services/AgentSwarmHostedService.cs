@@ -1,3 +1,4 @@
+using QuantCore.Agents.Execution;
 using System.Collections.Concurrent;
 using System.Text.Json;
 using QuantCore.Agents.Client;
@@ -36,6 +37,7 @@ public sealed class AgentSwarmHostedService : BackgroundService
     private readonly IEpisodeCommandWatcher _commandWatcher;
     private readonly IConfiguration _config;
     private readonly ILogger<AgentSwarmHostedService> _logger;
+    private readonly IOrderExecutionGateway _executionGateway;
 
     // Tracks carried open positions across generations per (ProfileKey, Symbol) so agents
     // do not pay repeated 10 bps entry taker fees when continuing an existing trend slice.
@@ -46,13 +48,15 @@ public sealed class AgentSwarmHostedService : BackgroundService
         IPositionSettlementStrategy settlementStrategy,
         IEpisodeCommandWatcher commandWatcher,
         IConfiguration config,
-        ILogger<AgentSwarmHostedService> logger)
+        ILogger<AgentSwarmHostedService> logger,
+        IOrderExecutionGateway? executionGateway = null)
     {
         _apiClient = apiClient;
         _settlementStrategy = settlementStrategy;
         _commandWatcher = commandWatcher;
         _config = config;
         _logger = logger;
+        _executionGateway = executionGateway ?? new SimulatedExecutionGateway();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -182,6 +186,18 @@ public sealed class AgentSwarmHostedService : BackgroundService
                         peakEquityUsdt = initialNotionalUsdt - deltaFee;
                         prevEquityUsdt = peakEquityUsdt;
 
+                        if (incrementalQty > 0m)
+                        {
+                            var orderRes = await _executionGateway.SubmitOrderAsync(
+                                new ExecutionOrderRequest(Guid.NewGuid(), tick.Symbol, "buy", incrementalQty, tick.Price, false),
+                                linkedCts.Token);
+                            if (!orderRes.Accepted)
+                            {
+                                _logger.LogWarning("[Agent {AgentId}] Carry delta order rejected ({Provider}/{Mode}): {Msg}",
+                                    agentId, orderRes.Provider, orderRes.Mode, orderRes.Message);
+                            }
+                        }
+
                         moves.Add(new ExecutedMoveRecord(
                             tick.Symbol,
                             "CARRY_INHERIT_SLICE",
@@ -211,6 +227,15 @@ public sealed class AgentSwarmHostedService : BackgroundService
                             initialNotionalUsdt = claim.ReservedQuantity * tick.Price;
                             peakEquityUsdt = initialNotionalUsdt - entryFee;
                             prevEquityUsdt = peakEquityUsdt;
+
+                            var orderRes = await _executionGateway.SubmitOrderAsync(
+                                new ExecutionOrderRequest(Guid.NewGuid(), tick.Symbol, "buy", claim.ReservedQuantity, tick.Price, false),
+                                linkedCts.Token);
+                            if (!orderRes.Accepted)
+                            {
+                                _logger.LogWarning("[Agent {AgentId}] Entry order rejected ({Provider}/{Mode}): {Msg}",
+                                    agentId, orderRes.Provider, orderRes.Mode, orderRes.Message);
+                            }
 
                             moves.Add(new ExecutedMoveRecord(
                                 tick.Symbol,
@@ -266,6 +291,15 @@ public sealed class AgentSwarmHostedService : BackgroundService
 
                         realizedPnlUsdt += tradeGrossPnl - exitFee;
                         openQuantities[tick.Symbol] = 0m;
+
+                        var sellRes = await _executionGateway.SubmitOrderAsync(
+                            new ExecutionOrderRequest(Guid.NewGuid(), tick.Symbol, "sell", heldQty, tick.Price, false),
+                            linkedCts.Token);
+                        if (!sellRes.Accepted)
+                        {
+                            _logger.LogWarning("[Agent {AgentId}] Exit order rejected ({Provider}/{Mode}): {Msg}",
+                                agentId, sellRes.Provider, sellRes.Mode, sellRes.Message);
+                        }
 
                         moves.Add(new ExecutedMoveRecord(
                             tick.Symbol,

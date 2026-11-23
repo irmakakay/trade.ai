@@ -11,11 +11,14 @@ from psycopg.rows import dict_row
 
 from adapter.queue_consumer import INPUT_QUEUE, OUTPUT_QUEUE, process_single_task
 from adapter.schemas import InputTaskMessage, TaskCommandType
+from execution_feedback import fetch_execution_reward_adjustment
 from quant_nn_engine import BrainStateCodec, QuantBrainBridge, ReplicaHistoryRecord
 
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
 QUANT_API_URL = os.getenv("QUANT_API_URL", "http://quant-api:8080").rstrip("/")
-BRIDGE = QuantBrainBridge(confidence_threshold=CONFIDENCE_THRESHOLD, hidden_dim=64)
+NN_HIDDEN_DIM = int(os.getenv("NN_HIDDEN_DIM", "128"))
+MAX_CHECKPOINTS_RETAINED = int(os.getenv("MAX_CHECKPOINTS_RETAINED", "25"))
+BRIDGE = QuantBrainBridge(confidence_threshold=CONFIDENCE_THRESHOLD, hidden_dim=NN_HIDDEN_DIM)
 
 
 def get_pg_conn_str() -> str:
@@ -36,19 +39,40 @@ def try_restore_latest_checkpoint() -> None:
                     """
                     SELECT version_tag, weights_blob, confidence_score, is_promoted_live
                     FROM nn_model_checkpoints
-                    WHERE weights_blob IS NOT NULL AND octet_length(weights_blob) > 0
-                    ORDER BY is_promoted_live DESC, confidence_score DESC, created_at DESC
+                    WHERE weights_blob IS NOT NULL
+                      AND octet_length(weights_blob) > 0
+                      AND COALESCE((architecture_config->>'hidden_dim')::int, 0) = %s
+                    ORDER BY is_promoted_live DESC, created_at DESC
                     LIMIT 1;
-                    """
+                    """,
+                    (NN_HIDDEN_DIM,),
                 )
                 row = cur.fetchone()
                 if not row:
+                    print(f"[quant_nn_worker] No existing {NN_HIDDEN_DIM}-dim checkpoint found; starting fresh.", flush=True)
                     return
+
                 raw_blob = bytes(row["weights_blob"])
-                meta = BrainStateCodec.load_state_bundle(raw_blob, BRIDGE.model, BRIDGE.optimizer)
+                model, optimizer, meta, restored_conf = BrainStateCodec.load_state_bundle(raw_blob, lr=4e-3)
+                if model.hidden_dim != NN_HIDDEN_DIM:
+                    print(
+                        f"[quant_nn_worker] Skipping checkpoint '{row['version_tag']}' "
+                        f"(hidden_dim={model.hidden_dim} != {NN_HIDDEN_DIM})",
+                        flush=True,
+                    )
+                    return
+
+                BRIDGE.model = model
+                BRIDGE.optimizer = optimizer
+                if isinstance(meta, dict):
+                    BRIDGE.generation_count = int(meta.get("generation_count", BRIDGE.generation_count))
+                    gen_by_prof = meta.get("generation_by_profile")
+                    if isinstance(gen_by_prof, dict):
+                        BRIDGE.generation_by_profile = {str(k): int(v) for k, v in gen_by_prof.items()}
+
                 print(
-                    f"[quant_nn_worker] Restored checkpoint '{row['version_tag']}' "
-                    f"(conf={float(row['confidence_score'])*100:.1f}%, promoted={row['is_promoted_live']}, meta={meta})",
+                    f"[quant_nn_worker] Restored {NN_HIDDEN_DIM}-dim checkpoint '{row['version_tag']}' "
+                    f"(conf={restored_conf*100:.1f}%, promoted={row['is_promoted_live']}, gen={BRIDGE.generation_count})",
                     flush=True,
                 )
     except Exception as exc:
@@ -99,6 +123,8 @@ def fetch_latest_generation_histories(cur, profile_key: str, limit: int) -> list
 
 def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
     ohlcv_by_symbol = fetch_live_ohlcv_window(task.candidate_symbols, limit=32)
+    exec_stats = fetch_execution_reward_adjustment(get_pg_conn_str(), lookback_minutes=60)
+    exec_penalty = float(exec_stats.get("reward_penalty", 0.0))
 
     with psycopg.connect(get_pg_conn_str(), row_factory=dict_row) as conn:
         with conn.cursor() as cur:
@@ -115,9 +141,35 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                 prior_histories=prior_histories,
             )
 
+            if exec_penalty > 0.0:
+                confidence = max(0.0, round(confidence - exec_penalty, 4))
+                result["is_promoted_for_live"] = bool(
+                    result["is_promoted_for_live"] and confidence >= CONFIDENCE_THRESHOLD
+                )
+
             if task.command == TaskCommandType.RECALCULATE_POOL:
+                # Expire any FK-referenced AVAILABLE slots rather than failing on FK delete
                 cur.execute(
-                    "DELETE FROM strategy_pool WHERE profile_key = %s AND status = 'AVAILABLE';",
+                    """
+                    UPDATE strategy_pool sp
+                    SET status = 'EXPIRED'
+                    WHERE sp.profile_key = %s
+                      AND sp.status = 'AVAILABLE'
+                      AND EXISTS (
+                          SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id
+                      );
+                    """,
+                    (task.profile_key,),
+                )
+                cur.execute(
+                    """
+                    DELETE FROM strategy_pool sp
+                    WHERE sp.profile_key = %s
+                      AND sp.status = 'AVAILABLE'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id
+                      );
+                    """,
                     (task.profile_key,),
                 )
                 for rep in result["replicas"]:
@@ -141,7 +193,12 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                 raw_bundle = BrainStateCodec.dump_state_bundle(
                     BRIDGE.model,
                     BRIDGE.optimizer,
-                    {"profile_key": task.profile_key, "ohlcv_symbols": list(ohlcv_by_symbol.keys())},
+                    {
+                        "profile_key": task.profile_key,
+                        "ohlcv_symbols": list(ohlcv_by_symbol.keys()),
+                        "generation_count": BRIDGE.generation_count,
+                        "generation_by_profile": BRIDGE.generation_by_profile,
+                    },
                     confidence,
                 )
                 cur.execute(
@@ -153,7 +210,7 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                     (
                         str(uuid4()),
                         f"{task.profile_key}_gen{result.get('generation', 1)}",
-                        json.dumps({"hidden_dim": BRIDGE.model.hidden_dim}),
+                        json.dumps({"hidden_dim": BRIDGE.model.hidden_dim, "model_arch": "PortfolioConditionedQuantNet_v2"}),
                         raw_bundle,
                         b"",
                         b"{}",
@@ -161,11 +218,24 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                         result["is_promoted_for_live"],
                     ),
                 )
+                # Keep table bounded so BYTEA checkpoints never bloat Postgres
+                cur.execute(
+                    """
+                    DELETE FROM nn_model_checkpoints
+                    WHERE model_id NOT IN (
+                        (SELECT model_id FROM nn_model_checkpoints ORDER BY created_at DESC LIMIT %s)
+                        UNION
+                        (SELECT model_id FROM nn_model_checkpoints WHERE is_promoted_live = true ORDER BY created_at DESC LIMIT 5)
+                    );
+                    """,
+                    (MAX_CHECKPOINTS_RETAINED,),
+                )
         conn.commit()
 
     print(
         f"[NN-EVOLUTION] Profile={task.profile_key} | Gen={result.get('generation', 0)} | "
         f"OHLCV_Syms={len(ohlcv_by_symbol)}/{len(task.candidate_symbols)} | "
+        f"ExecPen={exec_penalty:.4f} (ord={exec_stats['total_orders']}) | "
         f"Winner=Replica#{result['winning_prior_replica']} | Loss={result.get('train_loss', 0.0):.4f} | "
         f"Confidence={confidence*100:.1f}% | Promoted={result['is_promoted_for_live']}",
         flush=True,
@@ -203,7 +273,7 @@ def main() -> None:
             ch.basic_ack(delivery_tag=method.delivery_tag)
 
     channel.basic_consume(queue=INPUT_QUEUE, on_message_callback=_on_message)
-    print("[quant_nn_worker] Connected to quant_nn_engine. Listening on input_queue...")
+    print("[quant_nn_worker] Connected to quant_nn_engine. Listening on input_queue...", flush=True)
     channel.start_consuming()
 
 

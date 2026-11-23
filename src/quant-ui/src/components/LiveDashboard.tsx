@@ -291,7 +291,7 @@ export const LiveDashboard: React.FC = () => {
           <div style={{ marginTop: "8px", paddingTop: "8px", borderTop: "1px solid #334155", fontSize: "11px", fontFamily: "ui-monospace, monospace" }}>
             <div style={{ color: "#94a3b8", fontWeight: 700, marginBottom: "4px" }}>LIVE EVOLVED STRATEGY POOL (SL / TP / SLICE):</div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "4px" }}>
-              {(summary?.pool_state ?? []).map((s, idx) => {
+              {(summary?.pool_state ?? []).slice(0, 18).map((s, idx) => {
                 let meta = "";
                 try {
                   if (s.strategy_payload) {

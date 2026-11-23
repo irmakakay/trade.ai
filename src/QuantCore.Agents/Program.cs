@@ -27,23 +27,7 @@ else
 }
 
 
-// Execution gateway defaults to SIMULATED so existing swarm execution is completely unbroken
-string executionGatewayMode = (builder.Configuration["EXECUTION_GATEWAY"] ?? "SIMULATED")
-    .Trim()
-    .ToUpperInvariant();
-
-if (executionGatewayMode == "REVOLUT_X")
-{
-    string revxBaseUrl = builder.Configuration["REVX_API_BASE_URL"] ?? "https://revx.revolut.com";
-    builder.Services.AddHttpClient<IOrderExecutionGateway, RevolutXExecutionGateway>(client =>
-    {
-        client.BaseAddress = new Uri(revxBaseUrl);
-    });
-}
-else
-{
-    builder.Services.AddSingleton<IOrderExecutionGateway, SimulatedExecutionGateway>();
-}
+builder.Services.AddQuantExecutionInfrastructure(builder.Configuration);
 
 // Parse --mode switch (default: agent)
 string executionMode = "agent";

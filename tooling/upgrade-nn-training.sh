@@ -388,7 +388,7 @@ step "4/6 Restarting Updated Services & Cleaning Stale Pool Rows"
 run_guarded 30 "Restarting nn-worker and quant-api" docker compose up -d --no-deps nn-worker quant-api
 
 docker compose exec -T postgres psql -U quant -d quantcore -c "
-  UPDATE strategy_pool SET status = 'AVAILABLE', claimed_by_agent = NULL WHERE status = 'CLAIMED';
+  UPDATE strategy_pool SET status = 'AVAILABLE', claimed_by_agent_id = NULL WHERE status = 'CLAIMED';
 "
 ok "Active pool slots ready"
 

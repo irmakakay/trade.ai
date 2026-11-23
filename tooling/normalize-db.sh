@@ -29,9 +29,17 @@ UPDATE portfolio_inventory
 SET allocated_quantity = 0;
 
 -- 2. Reclaim any orphaned CLAIMED slots back to AVAILABLE
-UPDATE strategy_pool
-SET status = 'AVAILABLE'
-WHERE status = 'CLAIMED';
+-- Restore any row referenced by trading_history to COMPLETED
+UPDATE strategy_pool sp
+SET status = 'COMPLETED'
+WHERE sp.status IN ('AVAILABLE', 'CLAIMED')
+  AND EXISTS (SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id);
+
+-- Reclaim only unreferenced orphaned CLAIMED slots back to AVAILABLE
+UPDATE strategy_pool sp
+SET status = 'AVAILABLE', claimed_by_agent_id = NULL, claimed_at = NULL
+WHERE sp.status = 'CLAIMED'
+  AND NOT EXISTS (SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id);
 
 -- 3. Ensure every profile has exact active replicas (1, 2, 3) in AVAILABLE state
 --    If a partial generation left < 3 active slots for a profile, expire the partial set
@@ -103,10 +111,11 @@ CROSS JOIN replicas r;
 
 -- 4. Prune old COMPLETED/EXPIRED strategy_pool rows beyond the latest 30 per profile
 WITH ranked_history AS (
-  SELECT pool_instance_id,
-         ROW_NUMBER() OVER (PARTITION BY profile_key ORDER BY created_at DESC) AS rn
-  FROM strategy_pool
-  WHERE status IN ('COMPLETED', 'EXPIRED')
+  SELECT sp.pool_instance_id,
+         ROW_NUMBER() OVER (PARTITION BY sp.profile_key ORDER BY sp.created_at DESC) AS rn
+  FROM strategy_pool sp
+  WHERE sp.status IN ('COMPLETED', 'EXPIRED')
+    AND NOT EXISTS (SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id)
 )
 DELETE FROM strategy_pool
 WHERE pool_instance_id IN (

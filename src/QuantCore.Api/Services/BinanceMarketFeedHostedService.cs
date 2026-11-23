@@ -71,7 +71,14 @@ public sealed class BinanceMarketFeedHostedService : BackgroundService
                 _logger.LogWarning("[BinanceMarketFeed] Live WS unreachable ({Msg}). Running 15s synthetic GBM fallback...", ex.Message);
                 using var fallbackCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
                 fallbackCts.CancelAfter(TimeSpan.FromSeconds(15));
-                await RunSyntheticGbmFeedAsync(fallbackCts.Token);
+                try
+                {
+                    await RunSyntheticGbmFeedAsync(fallbackCts.Token);
+                }
+                catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+                {
+                    // 15s synthetic fallback window elapsed; retry live Binance WS
+                }
             }
         }
     }
@@ -167,7 +174,14 @@ public sealed class BinanceMarketFeedHostedService : BackgroundService
                     "SYNTHETIC_GBM",
                     DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
             }
-            await Task.Delay(250, ct);
+            try
+            {
+                await Task.Delay(250, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
         }
     }
 }

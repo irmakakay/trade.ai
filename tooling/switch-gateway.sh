@@ -18,13 +18,15 @@ NC='\033[0m'
 
 usage() {
   echo -e "${CYAN}Usage:${NC}"
-  echo "  $0 local              # Switch agents to local SIMULATED gateway"
-  echo "  $0 revolut [dry|live] # Switch to REVOLUT_X (defaults to safe DRY_RUN)"
+  echo "  $0 local              # SIMULATED gateway + FAKE auth handler"
+  echo "  $0 revolut dry [fake] # REVOLUT_X gateway + DRY_RUN=true + FAKE auth handler"
+  echo "  $0 revolut live       # REVOLUT_X gateway + DRY_RUN=false + ED25519 auth handler"
   exit 1
 }
 
 TARGET_MODE="${1:-}"
 SUB_MODE="${2:-dry}"
+AUTH_OVERRIDE="${3:-}"
 
 if [[ -z "$TARGET_MODE" ]]; then
   usage
@@ -85,16 +87,19 @@ case "$(echo "$TARGET_MODE" | tr '[:upper:]' '[:lower:]')" in
   local|sim|simulated)
     GW_VAL="SIMULATED"
     DRY_VAL="true"
-    LABEL="LOCAL (SIMULATED)"
+    AUTH_VAL="FAKE"
+    LABEL="LOCAL (SIMULATED | Auth=FAKE)"
     ;;
   revolut|revx|revolut_x)
     GW_VAL="REVOLUT_X"
     if [[ "$(echo "$SUB_MODE" | tr '[:upper:]' '[:lower:]')" == "live" ]]; then
       DRY_VAL="false"
-      LABEL="REVOLUT_X (LIVE)"
+      AUTH_VAL="${AUTH_OVERRIDE:-ED25519}"
+      LABEL="REVOLUT_X (LIVE | Auth=${AUTH_VAL})"
     else
       DRY_VAL="true"
-      LABEL="REVOLUT_X (DRY_RUN)"
+      AUTH_VAL="${AUTH_OVERRIDE:-FAKE}"
+      LABEL="REVOLUT_X (DRY_RUN | Auth=${AUTH_VAL})"
     fi
     ;;
   *)
@@ -102,21 +107,21 @@ case "$(echo "$TARGET_MODE" | tr '[:upper:]' '[:lower:]')" in
     ;;
 esac
 
-echo -e "${CYAN}━━━ [$(date +%H:%M:%S)] Switching Execution Gateway -> ${LABEL} ━━━${NC}"
+echo -e "${CYAN}━━━ [$(date +%H:%M:%S)] Switching Execution -> ${LABEL} ━━━${NC}"
 
 if [[ -x "$REPO_ROOT/tooling/normalize-db.sh" ]]; then
   "$REPO_ROOT/tooling/normalize-db.sh"
 fi
 
 EXECUTION_GATEWAY="$GW_VAL" \
+REVX_AUTH_PROVIDER="$AUTH_VAL" \
 REVX_DRY_RUN="$DRY_VAL" \
 REVX_MAX_ORDER_USDT="${REVX_MAX_ORDER_USDT:-25}" \
 AGENT_PROFILE_KEY="ALL" \
 EPISODE_SETTLEMENT_MODE="CARRY_POSITIONS" \
 EPISODE_MAX_TICKS=25 \
-  run_guarded 45 "Recreating 3 quant-agents with EXECUTION_GATEWAY=${GW_VAL} (DRY_RUN=${DRY_VAL})" \
+  run_guarded 45 "Recreating 3 quant-agents (${LABEL})" \
   dc --profile agents up -d --scale quant-agents=3 --force-recreate quant-agents
 
-echo -e "${GREEN}[OK]${NC} Gateway active: ${LABEL}"
-echo -e "${YELLOW}[INFO]${NC} Streaming agent & nn-worker logs (Ctrl+C to stop):"
+echo -e "${GREEN}[OK]${NC} Active mode: ${LABEL}"
 dc --profile agents logs -f --tail=20 quant-agents nn-worker

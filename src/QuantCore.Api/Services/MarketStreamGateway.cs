@@ -14,10 +14,24 @@ public sealed class MarketStreamGateway
     private readonly ConcurrentQueue<LiveStreamFrame> _recentEvents = new();
     private readonly ConcurrentDictionary<string, List<double[]>> _ohlcvBySymbol = new();
     private readonly object _ohlcvLock = new();
+    private const int SubscriberChannelCapacity = 1024;
     private const int MaxCandleWindow = 32;
     private const int MaxBufferedEvents = 30;
 
     public IReadOnlyDictionary<string, decimal> LatestPrices => _latestPrices;
+
+    public (ChannelReader<LiveStreamFrame> Reader, IDisposable Subscription) Subscribe()
+    {
+        Guid subId = Guid.NewGuid();
+        var channel = Channel.CreateBounded<LiveStreamFrame>(new BoundedChannelOptions(SubscriberChannelCapacity)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false
+        });
+        _subscribers[subId] = channel;
+        return (channel.Reader, new SubscriptionHandle(_subscribers, subId, channel));
+    }
 
     public void RecordOhlcvCandle(string symbol, double open, double high, double low, double close, double volume)
     {
@@ -80,33 +94,49 @@ public sealed class MarketStreamGateway
 
     public async Task HandleDashboardClientAsync(WebSocket ws, CancellationToken ct)
     {
-        Guid subId = Guid.NewGuid();
-        var channel = Channel.CreateBounded<LiveStreamFrame>(new BoundedChannelOptions(512)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
-        _subscribers[subId] = channel;
+        var (reader, subscription) = Subscribe();
+        using var _ = subscription;
 
-        try
+        // Replay recent non-tick agent/evolution events immediately on connect
+        foreach (var pastEvent in _recentEvents.ToArray())
         {
-            // Replay recent non-tick agent/evolution events immediately on connect
-            foreach (var pastEvent in _recentEvents.ToArray())
-            {
-                if (ws.State != WebSocketState.Open) break;
-                var replayPayload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(pastEvent));
-                await ws.SendAsync(replayPayload, WebSocketMessageType.Text, true, ct);
-            }
-
-            await foreach (var frame in channel.Reader.ReadAllAsync(ct))
-            {
-                if (ws.State != WebSocketState.Open) break;
-                var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(frame));
-                await ws.SendAsync(payload, WebSocketMessageType.Text, true, ct);
-            }
+            if (ws.State != WebSocketState.Open) break;
+            var replayPayload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(pastEvent));
+            await ws.SendAsync(replayPayload, WebSocketMessageType.Text, true, ct);
         }
-        finally
+
+        await foreach (var frame in reader.ReadAllAsync(ct))
         {
-            _subscribers.TryRemove(subId, out _);
+            if (ws.State != WebSocketState.Open) break;
+            var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(frame));
+            await ws.SendAsync(payload, WebSocketMessageType.Text, true, ct);
+        }
+    }
+
+    private sealed class SubscriptionHandle : IDisposable
+    {
+        private readonly ConcurrentDictionary<Guid, Channel<LiveStreamFrame>> _subscribers;
+        private readonly Guid _subId;
+        private readonly Channel<LiveStreamFrame> _channel;
+        private int _disposed;
+
+        public SubscriptionHandle(
+            ConcurrentDictionary<Guid, Channel<LiveStreamFrame>> subscribers,
+            Guid subId,
+            Channel<LiveStreamFrame> channel)
+        {
+            _subscribers = subscribers;
+            _subId = subId;
+            _channel = channel;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _subscribers.TryRemove(_subId, out _);
+                _channel.Writer.TryComplete();
+            }
         }
     }
 }

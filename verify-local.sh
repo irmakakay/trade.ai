@@ -197,7 +197,7 @@ if run_guarded 120 ".NET xUnit (QuantCore.Tests + QuantCore.Agents.Tests)" \
     -v "$(pwd):/src" \
     -v quant-nuget-cache:/root/.nuget/packages \
     -w /src \
-    mcr.microsoft.com/dotnet/sdk:8.0-alpine \
+    mcr.microsoft.com/dotnet/sdk:9.0-alpine \
     sh -c "dotnet test tests/QuantCore.Tests/QuantCore.Tests.csproj -c Release --nologo -v q --blame-hang-timeout 10s && \
            dotnet test tests/QuantCore.Agents.Tests/QuantCore.Agents.Tests.csproj -c Release --nologo -v q --blame-hang-timeout 10s"; then
   ok ".NET unit tests passed"

@@ -20,7 +20,7 @@ class QuantBrainBridge:
     High-level facade connecting `quant_nn_worker` task loop to `quant_nn_engine`.
     Performs online gradient updates on completed K-replica episodes during RECALCULATE_POOL.
     """
-    def __init__(self, confidence_threshold: float = 0.75, hidden_dim: int = 64):
+    def __init__(self, confidence_threshold: float = 0.75, hidden_dim: int = 128):
         self.confidence_threshold = confidence_threshold
         self.model = PortfolioConditionedQuantNet(hidden_dim=hidden_dim)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=4e-3, weight_decay=1e-4)

@@ -86,9 +86,15 @@ ok "Core stack is active"
 # 2. Reset Stale Strategy Pool Slots & Unreleased Slices
 step "2/5 Resetting Stale Strategy Pool Slots & Inventory Locks in PostgreSQL"
 docker compose exec -T postgres psql -U quant -d quantcore -c "
-  UPDATE strategy_pool
-  SET status = 'AVAILABLE', claimed_by_agent = NULL, claimed_at = NULL
-  WHERE status != 'AVAILABLE';
+  UPDATE strategy_pool sp
+  SET status = 'COMPLETED'
+  WHERE sp.status IN ('AVAILABLE', 'CLAIMED')
+    AND EXISTS (SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id);
+
+  UPDATE strategy_pool sp
+  SET status = 'AVAILABLE', claimed_by_agent_id = NULL, claimed_at = NULL
+  WHERE sp.status = 'CLAIMED'
+    AND NOT EXISTS (SELECT 1 FROM trading_history th WHERE th.pool_instance_id = sp.pool_instance_id);
 
   UPDATE strategy_allocations
   SET status = 'RELEASED'
@@ -123,7 +129,7 @@ docker compose --profile agents ps
 echo ""
 info "Active Strategy Pool State:"
 docker compose exec -T postgres psql -U quant -d quantcore -c \
-  "SELECT profile_key, replica_index, status, claimed_by_agent FROM strategy_pool ORDER BY profile_key, replica_index;"
+  "SELECT profile_key, replica_index, status, claimed_by_agent_id FROM strategy_pool ORDER BY profile_key, replica_index;"
 
 info "Recent Completed Episodes (trading_history):"
 docker compose exec -T postgres psql -U quant -d quantcore -c \
