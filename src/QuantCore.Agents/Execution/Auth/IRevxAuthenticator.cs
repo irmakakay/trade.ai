@@ -24,10 +24,29 @@ public abstract class RevxAuthenticatorBase : IRevxAuthenticator
     {
         long timestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         string normalizedMethod = (httpMethod ?? "GET").Trim().ToUpperInvariant();
-        string normalizedPath = string.IsNullOrWhiteSpace(requestPathAndQuery)
-            ? "/"
-            : (requestPathAndQuery.StartsWith('/') ? requestPathAndQuery : "/" + requestPathAndQuery);
-        string payload = $"{timestampMs.ToString(CultureInfo.InvariantCulture)}{normalizedMethod}{normalizedPath}{minifiedBody ?? string.Empty}";
+
+        // Revolut X signs: timestamp + METHOD + /api/... + query_string_WITHOUT_question_mark + body
+        string raw = string.IsNullOrWhiteSpace(requestPathAndQuery) ? "/" : requestPathAndQuery.Trim();
+        string normalizedPath;
+        string normalizedQuery = string.Empty;
+
+        int qIdx = raw.IndexOf('?');
+        if (qIdx >= 0)
+        {
+            normalizedPath = raw[..qIdx];
+            normalizedQuery = raw[(qIdx + 1)..];
+        }
+        else
+        {
+            normalizedPath = raw;
+        }
+
+        if (!normalizedPath.StartsWith('/'))
+        {
+            normalizedPath = "/" + normalizedPath;
+        }
+
+        string payload = $"{timestampMs.ToString(CultureInfo.InvariantCulture)}{normalizedMethod}{normalizedPath}{normalizedQuery}{minifiedBody ?? string.Empty}";
         return SignPayload(normalizedMethod, normalizedPath, payload, timestampMs);
     }
 

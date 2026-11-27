@@ -98,7 +98,7 @@ public sealed class TelemetryExecutionGateway : IOrderExecutionGateway
             cmd.Parameters.AddWithValue("execution_mode", result.Mode);
             cmd.Parameters.AddWithValue("symbol", request.Symbol);
             cmd.Parameters.AddWithValue("side", request.Side);
-            cmd.Parameters.AddWithValue("requested_qty", request.Quantity);
+            cmd.Parameters.AddWithValue("requested_qty", (result.ExecutedQuantity ?? request.Quantity));
             cmd.Parameters.AddWithValue("reference_price", request.ReferencePrice);
             cmd.Parameters.AddWithValue("executed_price", executedPrice);
             cmd.Parameters.AddWithValue("slippage_bps", slippageBps);

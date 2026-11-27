@@ -1,0 +1,831 @@
+===== src/QuantCore.Api/Services/BinanceMarketFeedHostedService.cs =====
+     1	using System.Globalization;
+     2	using System.Net.WebSockets;
+     3	using System.Text;
+     4	using System.Text.Json;
+     5	using QuantCore.Contracts.Domain;
+     6	
+     7	namespace QuantCore.Api.Services;
+     8	
+     9	public sealed class BinanceMarketFeedHostedService : BackgroundService
+    10	{
+    11	    private readonly MarketStreamGateway _gateway;
+    12	    private readonly IConfiguration _config;
+    13	    private readonly ILogger<BinanceMarketFeedHostedService> _logger;
+    14	
+    15	    public BinanceMarketFeedHostedService(
+    16	        MarketStreamGateway gateway,
+    17	        IConfiguration config,
+    18	        ILogger<BinanceMarketFeedHostedService> logger)
+    19	    {
+    20	        _gateway = gateway;
+    21	        _config = config;
+    22	        _logger = logger;
+    23	    }
+    24	
+    25	    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    26	    {
+    27	        bool forceSynthetic = _config.GetValue<bool>("USE_SYNTHETIC_MARKET_FEED", false);
+    28	        string wsUrl = _config["BINANCE_WS_URL"]
+    29	            ?? "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/ethusdt@kline_1m/solusdt@kline_1m";
+    30	
+    31	        var buffer = new byte[8192];
+    32	
+    33	        while (!stoppingToken.IsCancellationRequested)
+    34	        {
+    35	            if (forceSynthetic)
+    36	            {
+    37	                await RunSyntheticGbmFeedAsync(stoppingToken);
+    38	                continue;
+    39	            }
+    40	
+    41	            try
+    42	            {
+    43	                using var ws = new ClientWebSocket();
+    44	                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+    45	                connectCts.CancelAfter(TimeSpan.FromSeconds(5));
+    46	
+    47	                await ws.ConnectAsync(new Uri(wsUrl), connectCts.Token);
+    48	                _logger.LogInformation("[BinanceMarketFeed] Connected to live stream: {Url}", wsUrl);
+    49	
+    50	                while (ws.State == WebSocketState.Open && !stoppingToken.IsCancellationRequested)
+    51	                {
+    52	                    var res = await ws.ReceiveAsync(buffer, stoppingToken);
+    53	                    if (res.MessageType == WebSocketMessageType.Close) break;
+    54	
+    55	                    if (TryParseBinanceKlineWithOhlcv(buffer.AsSpan(0, res.Count), out var frame, out var candle))
+    56	                    {
+    57	                        if (candle is not null)
+    58	                        {
+    59	                            _gateway.RecordOhlcvCandle(frame.Symbol, candle[0], candle[1], candle[2], candle[3], candle[4]);
+    60	                        }
+    61	                        _gateway.PublishFrame(frame);
+    62	                    }
+    63	                }
+    64	            }
+    65	            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+    66	            {
+    67	                break;
+    68	            }
+    69	            catch (Exception ex)
+    70	            {
+    71	                _logger.LogWarning("[BinanceMarketFeed] Live WS unreachable ({Msg}). Running 15s synthetic GBM fallback...", ex.Message);
+    72	                using var fallbackCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+    73	                fallbackCts.CancelAfter(TimeSpan.FromSeconds(15));
+    74	                try
+    75	                {
+    76	                    await RunSyntheticGbmFeedAsync(fallbackCts.Token);
+    77	                }
+    78	                catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+    79	                {
+    80	                    // 15s synthetic fallback window elapsed; retry live Binance WS
+    81	                }
+    82	            }
+    83	        }
+    84	    }
+    85	
+    86	
+    87	    public static bool TryParseBinanceKlineWithOhlcv(
+    88	        ReadOnlySpan<byte> utf8Json,
+    89	        out LiveStreamFrame frame,
+    90	        out double[]? ohlcv)
+    91	    {
+    92	        ohlcv = null;
+    93	        if (!TryParseBinanceKline(utf8Json, out frame))
+    94	            return false;
+    95	
+    96	        try
+    97	        {
+    98	            using var doc = JsonDocument.Parse(utf8Json.ToArray());
+    99	            var root = doc.RootElement;
+   100	            var payload = root.TryGetProperty("data", out var dataElem) ? dataElem : root;
+   101	            if (payload.TryGetProperty("k", out var kline))
+   102	            {
+   103	                double c = (double)frame.Price;
+   104	                double o = kline.TryGetProperty("o", out var op) && double.TryParse(op.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var ov) ? ov : c;
+   105	                double h = kline.TryGetProperty("h", out var hp) && double.TryParse(hp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var hv) ? hv : Math.Max(o, c);
+   106	                double l = kline.TryGetProperty("l", out var lp) && double.TryParse(lp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var lv) ? lv : Math.Min(o, c);
+   107	                double v = kline.TryGetProperty("v", out var vp) && double.TryParse(vp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var vv) ? vv : 1.0;
+   108	                ohlcv = new[] { o, h, l, c, v };
+   109	            }
+   110	        }
+   111	        catch
+   112	        {
+   113	            // Keep frame even if optional OHLCV fields are absent
+   114	        }
+   115	        return true;
+   116	    }
+   117	
+   118	    public static bool TryParseBinanceKline(ReadOnlySpan<byte> utf8Json, out LiveStreamFrame frame)
+   119	    {
+   120	        frame = default;
+   121	        try
+   122	        {
+   123	            using var doc = JsonDocument.Parse(utf8Json.ToArray());
+   124	            var root = doc.RootElement;
+   125	            var payload = root.TryGetProperty("data", out var dataElem) ? dataElem : root;
+   126	
+   127	            if (!payload.TryGetProperty("k", out var kline))
+   128	                return false;
+   129	
+   130	            string symbol = kline.GetProperty("s").GetString() ?? "BTCUSDT";
+   131	            string closeStr = kline.GetProperty("c").GetString() ?? "0";
+   132	            long eventTime = payload.TryGetProperty("E", out var eProp)
+   133	                ? eProp.GetInt64()
+   134	                : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+   135	
+   136	            if (!decimal.TryParse(closeStr, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal price) || price <= 0m)
+   137	                return false;
+   138	
+   139	            frame = new LiveStreamFrame("MARKET_TICK", symbol, price, null, null, eventTime);
+   140	            return true;
+   141	        }
+   142	        catch
+   143	        {
+   144	            return false;
+   145	        }
+   146	    }
+   147	
+   148	    private async Task RunSyntheticGbmFeedAsync(CancellationToken ct)
+   149	    {
+   150	        var prices = new Dictionary<string, decimal>
+   151	        {
+   152	            ["BTCUSDT"] = 88500.00m,
+   153	            ["ETHUSDT"] = 3150.00m,
+   154	            ["SOLUSDT"] = 185.00m
+   155	        };
+   156	        var rng = new Random();
+   157	
+   158	        while (!ct.IsCancellationRequested)
+   159	        {
+   160	            foreach (var sym in prices.Keys.ToArray())
+   161	            {
+   162	                // Box-Muller normal shock: drift + volatility
+   163	                double u1 = 1.0 - rng.NextDouble();
+   164	                double u2 = 1.0 - rng.NextDouble();
+   165	                double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2);
+   166	                decimal pctMove = (decimal)(0.00005 + 0.0012 * z);
+   167	
+   168	                prices[sym] = Math.Round(Math.Max(0.01m, prices[sym] * (1.0m + pctMove)), 4);
+   169	                _gateway.PublishFrame(new LiveStreamFrame(
+   170	                    "MARKET_TICK",
+   171	                    sym,
+   172	                    prices[sym],
+   173	                    null,
+   174	                    "SYNTHETIC_GBM",
+   175	                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+   176	            }
+   177	            try
+   178	            {
+   179	                await Task.Delay(250, ct);
+   180	            }
+   181	            catch (OperationCanceledException)
+   182	            {
+   183	                break;
+   184	            }
+   185	        }
+   186	    }
+   187	}===== src/QuantCore.Api/Endpoints/AgentEpisodeEndpoints.cs =====
+     1	using System.Data;
+     2	using System.Text.Json;
+     3	using Dapper;
+     4	using QuantCore.Api.Messaging;
+     5	using QuantCore.Api.Services;
+     6	using QuantCore.Contracts.Domain;
+     7	using QuantCore.Contracts.Messaging;
+     8	
+     9	namespace QuantCore.Api.Endpoints;
+    10	
+    11	public static class AgentEpisodeEndpoints
+    12	{
+    13	    public static IEndpointRouteBuilder MapAgentEpisodeEndpoints(this IEndpointRouteBuilder app)
+    14	    {
+    15	        app.MapPost("/api/v1/episodes/commit", async (
+    16	            EpisodeCommitRequest req,
+    17	            Func<IDbConnection> dbFactory,
+    18	            IRabbitMqQueueService mq,
+    19	            MarketStreamGateway stream,
+    20	            IConfiguration cfg,
+    21	            CancellationToken ct) =>
+    22	        {
+    23	            using var conn = dbFactory();
+    24	            conn.Open();
+    25	            using var tx = conn.BeginTransaction();
+    26	
+    27	            // 1. Ensure trading_identities record exists
+    28	            const string upsertIdentitySql = @"
+    29	                INSERT INTO trading_identities (identity_id, actor_type, profile_key)
+    30	                VALUES (@IdentityId, @ActorType, @ProfileKey)
+    31	                ON CONFLICT (identity_id) DO NOTHING;";
+    32	            await conn.ExecuteAsync(new CommandDefinition(
+    33	                upsertIdentitySql, new { req.IdentityId, req.ActorType, req.ProfileKey }, tx, cancellationToken: ct));
+    34	
+    35	            // 2. Insert completed episode into trading_history & mark strategy_pool slot COMPLETED
+    36	            const string insertHistorySql = @"
+    37	                INSERT INTO trading_history
+    38	                    (run_id, pool_instance_id, identity_id, profile_key, replica_index, jitter_delta, executed_moves, realized_pnl_usdt, max_drawdown_pct, sharpe_estimate)
+    39	                VALUES
+    40	                    (@RunId, @PoolInstanceId, @IdentityId, @ProfileKey, @ReplicaIndex, @JitterDeltaJson::jsonb, @MovesJson::jsonb, @RealizedPnlUsdt, @MaxDrawdownPct, @SharpeEstimate);
+    41	
+    42	                UPDATE strategy_pool
+    43	                SET status = 'COMPLETED'
+    44	                WHERE pool_instance_id = @PoolInstanceId;";
+    45	
+    46	            await conn.ExecuteAsync(new CommandDefinition(
+    47	                insertHistorySql,
+    48	                new
+    49	                {
+    50	                    req.RunId,
+    51	                    req.PoolInstanceId,
+    52	                    req.IdentityId,
+    53	                    req.ProfileKey,
+    54	                    req.ReplicaIndex,
+    55	                    req.JitterDeltaJson,
+    56	                    MovesJson = JsonSerializer.Serialize(req.ExecutedMoves),
+    57	                    req.RealizedPnlUsdt,
+    58	                    req.MaxDrawdownPct,
+    59	                    req.SharpeEstimate
+    60	                },
+    61	                tx,
+    62	                cancellationToken: ct));
+    63	
+    64	            // 3. If LiquidateAndReleaseSlices == true, release active strategy_allocations back to portfolio_inventory
+    65	            int releasedCount = 0;
+    66	            // Always release DB slice reservation at episode boundary so next generation is never starved
+    67	            {
+    68	                const string releaseSlicesSql = @"
+    69	                    WITH released AS (
+    70	                        UPDATE strategy_allocations
+    71	                        SET status = 'RELEASED'
+    72	                        WHERE agent_id = @IdentityId AND status = 'ACTIVE'
+    73	                        RETURNING symbol, reserved_quantity
+    74	                    ),
+    75	                    agg AS (
+    76	                        SELECT symbol, SUM(reserved_quantity) AS total_released
+    77	                        FROM released
+    78	                        GROUP BY symbol
+    79	                    )
+    80	                    UPDATE portfolio_inventory pi
+    81	                    SET allocated_quantity = GREATEST(0, pi.allocated_quantity - agg.total_released),
+    82	                        updated_at = NOW()
+    83	                    FROM agg
+    84	                    WHERE pi.symbol = agg.symbol;";
+    85	
+    86	                releasedCount = await conn.ExecuteAsync(new CommandDefinition(releaseSlicesSql, new { req.IdentityId }, tx, cancellationToken: ct));
+    87	            }
+    88	
+    89	            // 4. Check if all K replicas for this profile have finished; if so, trigger evolutionary RECALCULATE_POOL
+    90	            const string remainingActiveSql = @"
+    91	                SELECT COUNT(1)
+    92	                FROM strategy_pool
+    93	                WHERE profile_key = @ProfileKey
+    94	                  AND status IN ('AVAILABLE', 'CLAIMED');";
+    95	
+    96	            int remaining = await conn.ExecuteScalarAsync<int>(
+    97	                new CommandDefinition(remainingActiveSql, new { req.ProfileKey }, tx, cancellationToken: ct));
+    98	
+    99	            tx.Commit();
+   100	
+   101	            bool triggeredRecalc = false;
+   102	            if (remaining == 0)
+   103	            {
+   104	                int kFactor = cfg.GetValue<int>("POOL_REPLICATION_FACTOR", 3);
+   105	                decimal profileRiskDial = req.ProfileKey.Trim().ToUpperInvariant() switch
+   106	                {
+   107	                    "CAREFUL_MEAN_REVERSION" => 0.25m,
+   108	                    "BALANCED_SWING" => 0.50m,
+   109	                    _ => 0.75m
+   110	                };
+   111	                mq.SubmitTaskToInputQueue(new InputTaskMessage(
+   112	                    Guid.NewGuid(),
+   113	                    TaskCommandType.RECALCULATE_POOL,
+   114	                    req.ProfileKey,
+   115	                    profileRiskDial,
+   116	                    kFactor,
+   117	                    new[] { "BTCUSDT", "ETHUSDT", "SOLUSDT" },
+   118	                    DateTimeOffset.UtcNow
+   119	                ));
+   120	                triggeredRecalc = true;
+   121	            }
+   122	
+   123	            stream.PublishFrame(new LiveStreamFrame(
+   124	                "EPISODE_COMMITTED",
+   125	                req.ProfileKey,
+   126	                req.RealizedPnlUsdt,
+   127	                req.IdentityId,
+   128	                req.LiquidateAndReleaseSlices ? "LIQUIDATED" : "CARRIED",
+   129	                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+   130	
+   131	            return Results.Ok(new EpisodeCommitResponse(true, req.RunId, releasedCount, triggeredRecalc));
+   132	        });
+   133	
+   134	        app.MapPost("/api/v1/episodes/reset", (EpisodeResetCommand cmd, MarketStreamGateway stream) =>
+   135	        {
+   136	            stream.PublishFrame(new LiveStreamFrame(
+   137	                "FORCE_EPISODE_RESET",
+   138	                cmd.ProfileKey ?? "ALL",
+   139	                0m,
+   140	                null,
+   141	                cmd.Reason,
+   142	                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+   143	            return Results.Ok(new { broadcasted = true, cmd.Reason });
+   144	        });
+   145	
+   146	
+   147	        app.MapGet("/api/v1/episodes/summary", async (Func<IDbConnection> dbFactory, CancellationToken ct) =>
+   148	        {
+   149	            using var conn = dbFactory();
+   150	            conn.Open();
+   151	
+   152	            const string kpiSql = @"
+   153	                SELECT
+   154	                    COUNT(1) AS total_episodes,
+   155	                    COALESCE(SUM(realized_pnl_usdt), 0) AS total_pnl_usdt,
+   156	                    COALESCE(AVG(sharpe_estimate), 0) AS avg_sharpe,
+   157	                    COALESCE(MAX(max_drawdown_pct), 0) AS worst_drawdown_pct,
+   158	                    (SELECT COUNT(1) FROM nn_model_checkpoints) AS total_checkpoints
+   159	                FROM trading_history;";
+   160	
+   161	            var kpis = await conn.QuerySingleAsync(new CommandDefinition(kpiSql, cancellationToken: ct));
+   162	
+   163	            const string recentEpisodesSql = @"
+   164	                SELECT run_id, profile_key, replica_index, realized_pnl_usdt, max_drawdown_pct, sharpe_estimate, completed_at
+   165	                FROM trading_history
+   166	                ORDER BY completed_at DESC
+   167	                LIMIT 15;";
+   168	
+   169	            var recentEpisodes = await conn.QueryAsync(new CommandDefinition(recentEpisodesSql, cancellationToken: ct));
+   170	
+   171	            const string nnCheckpointsSql = @"
+   172	                SELECT model_id, version_tag, confidence_score, is_promoted_live, created_at
+   173	                FROM nn_model_checkpoints
+   174	                ORDER BY created_at DESC
+   175	                LIMIT 8;";
+   176	
+   177	            var checkpoints = await conn.QueryAsync(new CommandDefinition(nnCheckpointsSql, cancellationToken: ct));
+   178	
+   179	            const string poolStateSql = @"
+   180	                SELECT DISTINCT ON (profile_key, replica_index)
+   181	                    profile_key, replica_index, status, risk_dial_r, strategy_payload::text AS strategy_payload
+   182	                FROM strategy_pool
+   183	                WHERE status IN ('AVAILABLE', 'CLAIMED')
+   184	                ORDER BY profile_key, replica_index, created_at DESC;";
+   185	
+   186	            var poolState = await conn.QueryAsync(new CommandDefinition(poolStateSql, cancellationToken: ct));
+   187	
+   188	            return Results.Ok(new
+   189	            {
+   190	                kpis,
+   191	                recent_episodes = recentEpisodes,
+   192	                nn_checkpoints = checkpoints,
+   193	                pool_state = poolState
+   194	            });
+   195	        });
+   196	
+   197	        app.MapGet("/api/v1/market/ohlcv-window", (int? limit, MarketStreamGateway stream) =>
+   198	        {
+   199	            var snapshot = stream.GetOhlcvSnapshot(limit ?? 32);
+   200	            return Results.Ok(new { candles_by_symbol = snapshot });
+   201	        });
+   202	
+   203	        return app;
+   204	    }
+   205	}
+===== src/quant_nn_engine/serialization/state_codec.py =====
+     1	import io
+     2	from typing import Any, Dict, Tuple
+     3	import torch
+     4	from models.network import PortfolioConditionedQuantNet
+     5	
+     6	
+     7	class BrainStateCodec:
+     8	    @staticmethod
+     9	    def dump_state_bundle(
+    10	        model: PortfolioConditionedQuantNet,
+    11	        optimizer: torch.optim.Optimizer,
+    12	        scaler_stats: Dict[str, Any],
+    13	        confidence_score: float,
+    14	    ) -> bytes:
+    15	        buf = io.BytesIO()
+    16	        bundle = {
+    17	            "arch": {
+    18	                "market_feature_dim": model.market_feature_dim,
+    19	                "portfolio_feature_dim": model.portfolio_feature_dim,
+    20	                "hidden_dim": model.hidden_dim,
+    21	            },
+    22	            "model_state": model.state_dict(),
+    23	            "optimizer_state": optimizer.state_dict(),
+    24	            "scaler_stats": scaler_stats,
+    25	            "confidence_score": float(confidence_score),
+    26	        }
+    27	        torch.save(bundle, buf)
+    28	        return buf.getvalue()
+    29	
+    30	    @staticmethod
+    31	    def load_state_bundle(
+    32	        raw_bytes: bytes,
+    33	        lr: float = 1e-3,
+    34	    ) -> Tuple[PortfolioConditionedQuantNet, torch.optim.Optimizer, Dict[str, Any], float]:
+    35	        buf = io.BytesIO(raw_bytes)
+    36	        bundle = torch.load(buf, weights_only=False)
+    37	        arch = bundle["arch"]
+    38	        model = PortfolioConditionedQuantNet(
+    39	            market_feature_dim=arch["market_feature_dim"],
+    40	            portfolio_feature_dim=arch["portfolio_feature_dim"],
+    41	            hidden_dim=arch["hidden_dim"],
+    42	        )
+    43	        model.load_state_dict(bundle["model_state"])
+    44	        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    45	        optimizer.load_state_dict(bundle["optimizer_state"])
+    46	        return model, optimizer, bundle["scaler_stats"], float(bundle["confidence_score"])
+===== src/QuantCore.Agents/Services/AgentSwarmHostedService.cs =====
+     1	using QuantCore.Agents.Execution;
+     2	using System.Collections.Concurrent;
+     3	using System.Text.Json;
+     4	using QuantCore.Agents.Client;
+     5	using QuantCore.Agents.Settlement;
+     6	using QuantCore.Contracts.Domain;
+     7	
+     8	namespace QuantCore.Agents.Services;
+     9	
+    10	public sealed record ParsedStrategyParams(
+    11	    decimal EntryThreshold,
+    12	    decimal StopLossAtr,
+    13	    decimal TakeProfitRr,
+    14	    decimal MaxSliceClaimPct,
+    15	    bool IsPromotedLive = false,
+    16	    decimal ModelConfidence = 0m,
+    17	    decimal ExpectedEdgeBps = 0m
+    18	);
+    19	
+    20	public sealed record CarriedPositionState(
+    21	    string Symbol,
+    22	    decimal Quantity,
+    23	    decimal EntryPrice
+    24	);
+    25	
+    26	public sealed class AgentSwarmHostedService : BackgroundService
+    27	{
+    28	    private const decimal TakerFeeRate = 0.0009m;
+    29	    private const decimal MakerFeeRate = 0.0000m;
+    30	    private const decimal BaseAtrPct = 0.0080m; // 80 bps baseline volatility unit
+    31	
+    32	    private static readonly string[] AllProfiles =
+    33	    {
+    34	        "AGGRESSIVE_BREAKOUT",
+    35	        "BALANCED_SWING",
+    36	        "CAREFUL_MEAN_REVERSION"
+    37	    };
+    38	
+    39	    private readonly IQuantApiClient _apiClient;
+    40	    private readonly IPositionSettlementStrategy _settlementStrategy;
+    41	    private readonly IEpisodeCommandWatcher _commandWatcher;
+    42	    private readonly IConfiguration _config;
+    43	    private readonly ILogger<AgentSwarmHostedService> _logger;
+    44	    private readonly IOrderExecutionGateway _executionGateway;
+    45	
+    46	    // Tracks carried open positions across generations per (ProfileKey, Symbol) so agents
+    47	    // do not pay repeated 10 bps entry taker fees when continuing an existing trend slice.
+    48	    private readonly ConcurrentDictionary<string, CarriedPositionState> _carriedPositions = new();
+    49	
+    50	    public AgentSwarmHostedService(
+    51	        IQuantApiClient apiClient,
+    52	        IPositionSettlementStrategy settlementStrategy,
+    53	        IEpisodeCommandWatcher commandWatcher,
+    54	        IConfiguration config,
+    55	        ILogger<AgentSwarmHostedService> logger,
+    56	        IOrderExecutionGateway? executionGateway = null)
+    57	    {
+    58	        _apiClient = apiClient;
+    59	        _settlementStrategy = settlementStrategy;
+    60	        _commandWatcher = commandWatcher;
+    61	        _config = config;
+    62	        _logger = logger;
+    63	        _executionGateway = executionGateway ?? new SimulatedExecutionGateway();
+    64	    }
+    65	
+    66	    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    67	    {
+    68	        string configuredProfile = (_config["AGENT_PROFILE_KEY"] ?? "ALL").Trim().ToUpperInvariant();
+    69	        string[] targetProfiles = configuredProfile == "ALL"
+    70	            ? AllProfiles
+    71	            : configuredProfile.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    72	
+    73	        if (targetProfiles.Length == 0)
+    74	        {
+    75	            targetProfiles = AllProfiles;
+    76	        }
+    77	
+    78	        int maxTicksPerEpisode = _config.GetValue<int>("EPISODE_MAX_TICKS", 40);
+    79	        int maxEpisodeSeconds = _config.GetValue<int>("EPISODE_MAX_SECONDS", 300);
+    80	        Guid agentId = Guid.NewGuid();
+    81	        int profileCursor = Random.Shared.Next(targetProfiles.Length);
+    82	
+    83	        _logger.LogInformation(
+    84	            "[Agent {AgentId}] Started swarm worker | Profiles=[{Profiles}] | Mode={Mode} | MaxTicks={Ticks}",
+    85	            agentId, string.Join(",", targetProfiles), _settlementStrategy.StrategyName, maxTicksPerEpisode);
+    86	
+    87	        while (!stoppingToken.IsCancellationRequested)
+    88	        {
+    89	            PoolSlotDto? slot = null;
+    90	
+    91	            // Round-robin across configured profiles so all strategy pools evolve concurrently
+    92	            for (int attempt = 0; attempt < targetProfiles.Length; attempt++)
+    93	            {
+    94	                string candidateProfile = targetProfiles[(profileCursor + attempt) % targetProfiles.Length];
+    95	                slot = await _apiClient.CheckoutStrategySlotAsync(agentId, candidateProfile, stoppingToken);
+    96	                if (slot is not null)
+    97	                {
+    98	                    profileCursor = (profileCursor + attempt + 1) % targetProfiles.Length;
+    99	                    break;
+   100	                }
+   101	            }
+   102	
+   103	            if (slot is null)
+   104	            {
+   105	                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+   106	                continue;
+   107	            }
+   108	
+   109	            await RunSingleEpisodeAsync(agentId, slot, maxTicksPerEpisode, maxEpisodeSeconds, stoppingToken);
+   110	        }
+   111	    }
+   112	
+   113	    public async Task<EpisodeCommitResponse?> RunSingleEpisodeAsync(
+   114	        Guid agentId,
+   115	        PoolSlotDto slot,
+   116	        int maxTicks,
+   117	        int maxSeconds,
+   118	        CancellationToken stoppingToken)
+   119	    {
+   120	        var candidateSymbols = JsonSerializer.Deserialize<List<string>>(slot.CandidateSymbolsJson)
+   121	            ?? new List<string> { "SOLUSDT" };
+   122	        var strat = ParseStrategyPayload(slot.StrategyPayloadJson);
+   123	
+   124	        bool isCarryMode = _settlementStrategy.StrategyName.Equals("CARRY_POSITIONS", StringComparison.OrdinalIgnoreCase);
+   125	
+   126	        var openQuantities = new Dictionary<string, decimal>();
+   127	        var entryPrices = new Dictionary<string, decimal>();
+   128	        var latestPrices = new Dictionary<string, decimal>();
+   129	        var moves = new List<ExecutedMoveRecord>();
+   130	
+   131	        using var durationCts = new CancellationTokenSource(TimeSpan.FromSeconds(maxSeconds));
+   132	        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+   133	            stoppingToken,
+   134	            durationCts.Token,
+   135	            _commandWatcher.CurrentEpisodeResetToken);
+   136	
+   137	        int ticksProcessed = 0;
+   138	        decimal realizedPnlUsdt = 0m;
+   139	        decimal initialNotionalUsdt = 0m;
+   140	        decimal peakEquityUsdt = 0m;
+   141	        decimal prevEquityUsdt = 0m;
+   142	        decimal maxDrawdownPct = 0m;
+   143	
+   144	        // Welford online variance accumulators for tick-by-tick returns
+   145	        int returnCount = 0;
+   146	        double meanReturn = 0.0;
+   147	        double m2Return = 0.0;
+   148	
+   149	        try
+   150	        {
+   151	            while (ticksProcessed < maxTicks && !linkedCts.Token.IsCancellationRequested)
+   152	            {
+   153	                var tick = await _commandWatcher.MarketTicksReader.ReadAsync(linkedCts.Token);
+   154	                if (tick.Price <= 0m) continue;
+   155	
+   156	                latestPrices[tick.Symbol] = tick.Price;
+   157	                ticksProcessed++;
+   158	
+   159	                // 1. Entry or Carried Position Adoption
+   160	                if (openQuantities.Count == 0 && entryPrices.Count == 0 && candidateSymbols.Contains(tick.Symbol))
+   161	                {
+   162	                    string carryKey = $"{slot.ProfileKey}:{tick.Symbol}";
+   163	
+   164	                    if (isCarryMode && _carriedPositions.TryRemove(carryKey, out var carried) && carried.Quantity > 0m)
+   165	                    {
+   166	                        // Re-lock slice in API mutex without paying a duplicate 10 bps entry taker fee
+   167	                        var claim = await _apiClient.ClaimSymbolSliceAsync(
+   168	                            new ShareSliceClaimRequest(
+   169	                                agentId,
+   170	                                slot.PoolInstanceId,
+   171	                                tick.Symbol,
+   172	                                strat.MaxSliceClaimPct,
+   173	                                "LONG_ACCUMULATING"),
+   174	                            linkedCts.Token);
+   175	
+   176	                        decimal activeQty = (claim is { Claimed: true, ReservedQuantity: > 0m })
+   177	                            ? claim.ReservedQuantity
+   178	                            : carried.Quantity;
+   179	
+   180	                        // Only charge taker fee on net incremental quantity added above the carried position
+   181	                        decimal incrementalQty = Math.Max(0m, activeQty - carried.Quantity);
+   182	                        decimal deltaFee = Math.Round(incrementalQty * tick.Price * MakerFeeRate, 8);
+   183	
+   184	                        // Mark-to-market baseline from current tick price for this episode's delta PnL
+   185	                        openQuantities[tick.Symbol] = activeQty;
+   186	                        entryPrices[tick.Symbol] = tick.Price;
+   187	                        realizedPnlUsdt -= deltaFee;
+   188	
+   189	                        initialNotionalUsdt = activeQty * tick.Price;
+   190	                        peakEquityUsdt = initialNotionalUsdt - deltaFee;
+   191	                        prevEquityUsdt = peakEquityUsdt;
+   192	
+   193	                        if (incrementalQty > 0m)
+   194	                        {
+   195	                            var orderRes = await _executionGateway.SubmitOrderAsync(
+   196	                                new ExecutionOrderRequest(Guid.NewGuid(), tick.Symbol, "buy", incrementalQty, tick.Price, strat.IsPromotedLive, slot.ReplicaIndex, strat.ModelConfidence, strat.ExpectedEdgeBps, "ENTRY", slot.ProfileKey),
+   197	                                linkedCts.Token);
+   198	                            if (!orderRes.Accepted)
+   199	                            {
+   200	                                _logger.LogWarning("[Agent {AgentId}] Carry delta order rejected ({Provider}/{Mode}): {Msg}",
+   201	                                    agentId, orderRes.Provider, orderRes.Mode, orderRes.Message);
+   202	                            }
+   203	                        }
+   204	
+   205	                        moves.Add(new ExecutedMoveRecord(
+   206	                            tick.Symbol,
+   207	                            "CARRY_INHERIT_SLICE",
+   208	                            activeQty,
+   209	                            tick.Price,
+   210	                            deltaFee,
+   211	                            tick.TimestampMs));
+   212	                    }
+   213	                    else
+   214	                    {
+   215	                        var claim = await _apiClient.ClaimSymbolSliceAsync(
+   216	                            new ShareSliceClaimRequest(
+   217	                                agentId,
+   218	                                slot.PoolInstanceId,
+   219	                                tick.Symbol,
+   220	                                strat.MaxSliceClaimPct,
+   221	                                "LONG_ACCUMULATING"),
+   222	                            linkedCts.Token);
+   223	
+   224	                        if (claim is { Claimed: true, ReservedQuantity: > 0m })
+   225	                        {
+   226	                            decimal entryFee = Math.Round(claim.ReservedQuantity * tick.Price * MakerFeeRate, 8);
+   227	                            openQuantities[tick.Symbol] = claim.ReservedQuantity;
+   228	                            entryPrices[tick.Symbol] = tick.Price;
+   229	                            realizedPnlUsdt -= entryFee;
+   230	
+   231	                            initialNotionalUsdt = claim.ReservedQuantity * tick.Price;
+   232	                            peakEquityUsdt = initialNotionalUsdt - entryFee;
+   233	                            prevEquityUsdt = peakEquityUsdt;
+   234	
+   235	                            var orderRes = await _executionGateway.SubmitOrderAsync(
+   236	                                new ExecutionOrderRequest(Guid.NewGuid(), tick.Symbol, "buy", claim.ReservedQuantity, tick.Price, strat.IsPromotedLive, slot.ReplicaIndex, strat.ModelConfidence, strat.ExpectedEdgeBps, "ENTRY", slot.ProfileKey),
+   237	                                linkedCts.Token);
+   238	                            if (!orderRes.Accepted)
+   239	                            {
+   240	                                _logger.LogWarning("[Agent {AgentId}] Entry order rejected ({Provider}/{Mode}): {Msg}",
+   241	                                    agentId, orderRes.Provider, orderRes.Mode, orderRes.Message);
+   242	                            }
+   243	
+   244	                            moves.Add(new ExecutedMoveRecord(
+   245	                                tick.Symbol,
+   246	                                "BUY_SLICE_CLAIM",
+   247	                                claim.ReservedQuantity,
+   248	                                tick.Price,
+   249	                                entryFee,
+   250	                                tick.TimestampMs));
+   251	                        }
+   252	                    }
+   253	                    continue;
+   254	                }
+   255	
+   256	                // 2. Mark-to-Market Valuation, Stop-Loss / Take-Profit Check & Online Sharpe Update
+   257	                if (openQuantities.TryGetValue(tick.Symbol, out decimal heldQty) && heldQty > 0m)
+   258	                {
+   259	                    decimal entryPrice = entryPrices[tick.Symbol];
+   260	                    decimal priceReturnPct = (tick.Price - entryPrice) / entryPrice;
+   261	
+   262	                    decimal stopLossPct = -strat.StopLossAtr * BaseAtrPct;
+   263	                    decimal takeProfitPct = strat.StopLossAtr * BaseAtrPct * strat.TakeProfitRr;
+   264	
+   265	                    decimal currentPositionValue = heldQty * tick.Price;
+   266	                    decimal currentEquity = initialNotionalUsdt + realizedPnlUsdt + (heldQty * (tick.Price - entryPrice));
+   267	
+   268	                    if (prevEquityUsdt > 0m)
+   269	                    {
+   270	                        double stepRet = (double)((currentEquity - prevEquityUsdt) / prevEquityUsdt);
+   271	                        returnCount++;
+   272	                        double delta = stepRet - meanReturn;
+   273	                        meanReturn += delta / returnCount;
+   274	                        double delta2 = stepRet - meanReturn;
+   275	                        m2Return += delta * delta2;
+   276	                    }
+   277	                    prevEquityUsdt = currentEquity;
+   278	
+   279	                    if (currentEquity > peakEquityUsdt)
+   280	                    {
+   281	                        peakEquityUsdt = currentEquity;
+   282	                    }
+   283	                    else if (peakEquityUsdt > 0m)
+   284	                    {
+   285	                        decimal dd = (peakEquityUsdt - currentEquity) / peakEquityUsdt;
+   286	                        if (dd > maxDrawdownPct) maxDrawdownPct = Math.Round(dd, 4);
+   287	                    }
+   288	
+   289	                    // Dynamic Stop-Loss or Take-Profit Exit
+   290	                    if (priceReturnPct <= stopLossPct || priceReturnPct >= takeProfitPct)
+   291	                    {
+   292	                        string exitAction = priceReturnPct >= takeProfitPct ? "SELL_TAKE_PROFIT" : "SELL_STOP_LOSS";
+   293	                        decimal exitFee = Math.Round(currentPositionValue * (exitAction == "SELL_TAKE_PROFIT" ? MakerFeeRate : TakerFeeRate), 8);
+   294	                        decimal tradeGrossPnl = heldQty * (tick.Price - entryPrice);
+   295	
+   296	                        realizedPnlUsdt += tradeGrossPnl - exitFee;
+   297	                        openQuantities[tick.Symbol] = 0m;
+   298	
+   299	                        var sellRes = await _executionGateway.SubmitOrderAsync(
+   300	                            new ExecutionOrderRequest(Guid.NewGuid(), tick.Symbol, "sell", heldQty, tick.Price, strat.IsPromotedLive, slot.ReplicaIndex, strat.ModelConfidence, strat.ExpectedEdgeBps, exitAction == "SELL_TAKE_PROFIT" ? "TAKE_PROFIT" : "STOP_LOSS", slot.ProfileKey),
+   301	                            linkedCts.Token);
+   302	                        if (!sellRes.Accepted)
+   303	                        {
+   304	                            _logger.LogWarning("[Agent {AgentId}] Exit order rejected ({Provider}/{Mode}): {Msg}",
+   305	                                agentId, sellRes.Provider, sellRes.Mode, sellRes.Message);
+   306	                        }
+   307	
+   308	                        moves.Add(new ExecutedMoveRecord(
+   309	                            tick.Symbol,
+   310	                            exitAction,
+   311	                            heldQty,
+   312	                            tick.Price,
+   313	                            exitFee,
+   314	                            tick.TimestampMs));
+   315	                        break; // Position closed; settle episode immediately
+   316	                    }
+   317	                }
+   318	            }
+   319	        }
+   320	        catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+   321	        {
+   322	            _logger.LogInformation("[Agent {AgentId}] Episode interrupted by Precedence Reset or Time Window.", agentId);
+   323	        }
+   324	
+   325	        // Evaluate open positions at episode boundary
+   326	        foreach (var (sym, qty) in openQuantities)
+   327	        {
+   328	            if (qty > 0m && latestPrices.TryGetValue(sym, out decimal lastP) && entryPrices.TryGetValue(sym, out decimal entP))
+   329	            {
+   330	                realizedPnlUsdt += qty * (lastP - entP);
+   331	
+   332	                if (isCarryMode)
+   333	                {
+   334	                    _carriedPositions[$"{slot.ProfileKey}:{sym}"] = new CarriedPositionState(sym, qty, lastP);
+   335	                }
+   336	            }
+   337	        }
+   338	
+   339	        decimal sharpeEstimate = ComputeAnnualizedSharpe(returnCount, meanReturn, m2Return);
+   340	
+   341	        var context = new ActiveAgentContext(
+   342	            RunId: Guid.NewGuid(),
+   343	            PoolInstanceId: slot.PoolInstanceId,
+   344	            AgentId: agentId,
+   345	            ActorType: "AGENT",
+   346	            ProfileKey: slot.ProfileKey,
+   347	            ReplicaIndex: slot.ReplicaIndex,
+   348	            JitterDeltaJson: slot.JitterDeltaJson,
+   349	            ExecutedMoves: moves,
+   350	            RealizedPnlUsdt: Math.Round(realizedPnlUsdt, 8),
+   351	            MaxDrawdownPct: Math.Round(maxDrawdownPct, 4),
+   352	            SharpeEstimate: sharpeEstimate,
+   353	            OpenSymbolQuantities: openQuantities,
+   354	            LatestMarketPrices: latestPrices
+   355	        );
+   356	
+   357	        return await _settlementStrategy.SettleEpisodeAsync(context, stoppingToken);
+   358	    }
+   359	
+   360	    public static ParsedStrategyParams ParseStrategyPayload(string json)
+   361	    {
+   362	        try
+   363	        {
+   364	            using var doc = JsonDocument.Parse(json);
+   365	            var root = doc.RootElement;
+   366	            decimal entry = root.TryGetProperty("entry_threshold", out var e) ? e.GetDecimal() : 0.60m;
+   367	            decimal sl = root.TryGetProperty("stop_loss_atr", out var s) ? s.GetDecimal() : 1.50m;
+   368	            decimal tp = root.TryGetProperty("take_profit_rr", out var t) ? t.GetDecimal() : 2.00m;
+   369	            decimal slice = root.TryGetProperty("max_slice_claim_pct", out var m) ? m.GetDecimal() : 0.25m;
+   370	            bool isPromoted = root.TryGetProperty("is_promoted_live", out var pr) && pr.ValueKind == JsonValueKind.True;
+   371	            decimal modelConf = root.TryGetProperty("confidence_score", out var cf) && cf.TryGetDecimal(out var cVal) ? cVal : 0m;
+   372	            decimal edgeBps = root.TryGetProperty("expected_return_bps", out var eb) && eb.TryGetDecimal(out var eVal) ? eVal : 0m;
+   373	            return new ParsedStrategyParams(entry, sl, tp, Math.Clamp(slice, 0.01m, 1.0m), isPromoted, modelConf, edgeBps);
+   374	        }
+   375	        catch
+   376	        {
+   377	            return new ParsedStrategyParams(0.60m, 1.50m, 2.00m, 0.25m);
+   378	        }
+   379	    }
+   380	
+   381	    public static decimal ComputeAnnualizedSharpe(int count, double mean, double m2)
+   382	    {
+   383	        if (count < 2) return 0m;
+   384	        double variance = m2 / (count - 1);
+   385	        double stdDev = Math.Sqrt(Math.Max(variance, 1e-12));
+   386	        if (stdDev <= 1e-9) return 0m;
+   387	        double rawSharpe = (mean / stdDev) * Math.Sqrt(count);
+   388	        return Math.Round((decimal)Math.Clamp(rawSharpe, -10.0, 10.0), 4);
+   389	    }
+   390	}

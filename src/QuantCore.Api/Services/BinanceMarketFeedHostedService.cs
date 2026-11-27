@@ -149,9 +149,9 @@ public sealed class BinanceMarketFeedHostedService : BackgroundService
     {
         var prices = new Dictionary<string, decimal>
         {
-            ["BTCUSDT"] = 88500.00m,
-            ["ETHUSDT"] = 3150.00m,
-            ["SOLUSDT"] = 185.00m
+            ["BTCUSDT"] = _gateway.LatestPrices.TryGetValue("BTCUSDT", out var btc) && btc > 0m ? btc : 65000.00m,
+            ["ETHUSDT"] = _gateway.LatestPrices.TryGetValue("ETHUSDT", out var eth) && eth > 0m ? eth : 3100.00m,
+            ["SOLUSDT"] = _gateway.LatestPrices.TryGetValue("SOLUSDT", out var sol) && sol > 0m ? sol : 75.00m
         };
         var rng = new Random();
 

@@ -15,15 +15,18 @@ public sealed class RevxEd25519Authenticator : RevxAuthenticatorBase
 
     public RevxEd25519Authenticator(IConfiguration config, ILogger<RevxEd25519Authenticator> logger)
     {
-        _apiKey = (config["REVX_API_KEY"] ?? string.Empty).Trim();
-        string pemOrPath = (config["REVX_PRIVATE_KEY_PEM"] ?? string.Empty).Trim();
+        _apiKey = (config["REVX_API_KEY"] ?? string.Empty).Trim().Trim('"');
+        string pemOrPath = (config["REVX_PRIVATE_KEY_PEM"] ?? string.Empty).Trim().Trim('"');
 
         if (string.IsNullOrWhiteSpace(pemOrPath))
             return;
 
         try
         {
-            string pemText = File.Exists(pemOrPath) ? File.ReadAllText(pemOrPath) : pemOrPath;
+            string pemText = File.Exists(pemOrPath)
+                ? File.ReadAllText(pemOrPath)
+                : pemOrPath.Replace("\\r\\n", "\n").Replace("\\n", "\n").Replace("\\r", string.Empty);
+
             using var reader = new StringReader(pemText);
             var parsed = new PemReader(reader).ReadObject();
 

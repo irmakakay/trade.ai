@@ -1,3 +1,4 @@
+using QuantCore.Agents.Execution.Middleware;
 using QuantCore.Agents.Execution;
 using QuantCore.Agents.Cli;
 using QuantCore.Agents.Client;
@@ -45,6 +46,20 @@ if (executionMode == "cli")
     using var host = builder.Build();
     var cli = host.Services.GetRequiredService<InteractiveCliRunner>();
     await cli.RunInteractiveLoopAsync(CancellationToken.None);
+}
+else if (executionMode == "revx-smoke")
+{
+    string revxBaseUrl = builder.Configuration["REVX_API_BASE_URL"] ?? "https://revx.revolut.com";
+    builder.Services.AddHttpClient<RevxSmokeTestRunner>(client =>
+    {
+        client.BaseAddress = new Uri(revxBaseUrl);
+        client.Timeout = TimeSpan.FromSeconds(15);
+    })
+    .AddHttpMessageHandler<RevxSigningDelegatingHandler>();
+
+    using var host = builder.Build();
+    var smoke = host.Services.GetRequiredService<RevxSmokeTestRunner>();
+    Environment.ExitCode = await smoke.RunAsync(CancellationToken.None);
 }
 else
 {

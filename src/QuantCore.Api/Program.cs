@@ -30,6 +30,7 @@ builder.Services.AddSingleton<IInventoryLockRepository, InventoryLockRepository>
 builder.Services.AddSingleton<MarketStreamGateway>();
 builder.Services.AddHostedService<PoolWarmupHostedService>();
 builder.Services.AddHostedService<BinanceMarketFeedHostedService>();
+builder.Services.AddHostedService<StaleClaimReaperHostedService>();
 
 var app = builder.Build();
 

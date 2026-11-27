@@ -1,3 +1,4 @@
+using System.Net.Http;
 using QuantCore.Agents.Execution.Auth;
 using QuantCore.Agents.Execution.Middleware;
 
@@ -34,6 +35,7 @@ public static class ExecutionServiceCollectionExtensions
 
         services.AddSingleton<IRevxAuthenticator>(sp => sp.GetRequiredService<RevxAuthenticatorBase>());
         services.AddTransient<RevxSigningDelegatingHandler>();
+        services.AddSingleton<SimulatedExecutionGateway>();
 
         if (gatewayMode == "REVOLUT_X")
         {
@@ -49,15 +51,21 @@ public static class ExecutionServiceCollectionExtensions
             .SetHandlerLifetime(Timeout.InfiniteTimeSpan)
             .AddHttpMessageHandler<RevxSigningDelegatingHandler>();
 
+            services.AddSingleton<PromotedRoutingExecutionGateway>(sp =>
+                new PromotedRoutingExecutionGateway(
+                    sp.GetRequiredService<SimulatedExecutionGateway>(),
+                    sp.GetRequiredService<RevolutXExecutionGateway>(),
+                    sp.GetRequiredService<IConfiguration>(),
+                    sp.GetRequiredService<ILogger<PromotedRoutingExecutionGateway>>()));
+
             services.AddSingleton<IOrderExecutionGateway>(sp =>
                 new TelemetryExecutionGateway(
-                    sp.GetRequiredService<RevolutXExecutionGateway>(),
+                    sp.GetRequiredService<PromotedRoutingExecutionGateway>(),
                     sp.GetRequiredService<IConfiguration>(),
                     sp.GetRequiredService<ILogger<TelemetryExecutionGateway>>()));
         }
         else
         {
-            services.AddSingleton<SimulatedExecutionGateway>();
             services.AddSingleton<IOrderExecutionGateway>(sp =>
                 new TelemetryExecutionGateway(
                     sp.GetRequiredService<SimulatedExecutionGateway>(),

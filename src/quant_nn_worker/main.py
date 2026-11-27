@@ -18,7 +18,16 @@ CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
 QUANT_API_URL = os.getenv("QUANT_API_URL", "http://quant-api:8080").rstrip("/")
 NN_HIDDEN_DIM = int(os.getenv("NN_HIDDEN_DIM", "128"))
 MAX_CHECKPOINTS_RETAINED = int(os.getenv("MAX_CHECKPOINTS_RETAINED", "25"))
+MIN_CONSECUTIVE_PROMOTED_GENS = int(os.getenv("MIN_CONSECUTIVE_PROMOTED_GENS", "2"))
+
+# Rolling Out-Of-Sample (OOS) promotion gates over recent completed episodes
+OOS_LOOKBACK_EPISODES = int(os.getenv("OOS_LOOKBACK_EPISODES", "30"))
+MIN_OOS_EPISODES = int(os.getenv("MIN_OOS_EPISODES", "15"))
+MIN_OOS_SHARPE = float(os.getenv("MIN_OOS_SHARPE", "0.35"))
+MIN_OOS_WIN_RATE = float(os.getenv("MIN_OOS_WIN_RATE", "0.55"))
+
 BRIDGE = QuantBrainBridge(confidence_threshold=CONFIDENCE_THRESHOLD, hidden_dim=NN_HIDDEN_DIM)
+PROMOTED_STREAK_BY_PROFILE: dict[str, int] = {}
 
 
 def get_pg_conn_str() -> str:
@@ -55,11 +64,6 @@ def try_restore_latest_checkpoint() -> None:
                 raw_blob = bytes(row["weights_blob"])
                 model, optimizer, meta, restored_conf = BrainStateCodec.load_state_bundle(raw_blob, lr=4e-3)
                 if model.hidden_dim != NN_HIDDEN_DIM:
-                    print(
-                        f"[quant_nn_worker] Skipping checkpoint '{row['version_tag']}' "
-                        f"(hidden_dim={model.hidden_dim} != {NN_HIDDEN_DIM})",
-                        flush=True,
-                    )
                     return
 
                 BRIDGE.model = model
@@ -69,6 +73,9 @@ def try_restore_latest_checkpoint() -> None:
                     gen_by_prof = meta.get("generation_by_profile")
                     if isinstance(gen_by_prof, dict):
                         BRIDGE.generation_by_profile = {str(k): int(v) for k, v in gen_by_prof.items()}
+                    streaks = meta.get("promoted_streak_by_profile")
+                    if isinstance(streaks, dict):
+                        PROMOTED_STREAK_BY_PROFILE.update({str(k): int(v) for k, v in streaks.items()})
 
                 print(
                     f"[quant_nn_worker] Restored {NN_HIDDEN_DIM}-dim checkpoint '{row['version_tag']}' "
@@ -121,6 +128,34 @@ def fetch_latest_generation_histories(cur, profile_key: str, limit: int) -> list
     ]
 
 
+def fetch_rolling_oos_metrics(cur, profile_key: str, window: int) -> dict[str, float]:
+    cur.execute(
+        """
+        WITH recent AS (
+            SELECT realized_pnl_usdt, sharpe_estimate
+            FROM trading_history
+            WHERE profile_key = %s
+            ORDER BY completed_at DESC
+            LIMIT %s
+        )
+        SELECT
+            COUNT(*)::int AS episodes,
+            COALESCE(AVG(sharpe_estimate), 0.0)::float AS avg_sharpe,
+            COALESCE(SUM(realized_pnl_usdt), 0.0)::float AS net_pnl,
+            COALESCE(AVG(CASE WHEN realized_pnl_usdt > 0 THEN 1.0 ELSE 0.0 END), 0.0)::float AS win_rate
+        FROM recent;
+        """,
+        (profile_key, window),
+    )
+    row = cur.fetchone() or {}
+    return {
+        "episodes": int(row.get("episodes") or 0),
+        "avg_sharpe": float(row.get("avg_sharpe") or 0.0),
+        "net_pnl": float(row.get("net_pnl") or 0.0),
+        "win_rate": float(row.get("win_rate") or 0.0),
+    }
+
+
 def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
     ohlcv_by_symbol = fetch_live_ohlcv_window(task.candidate_symbols, limit=32)
     exec_stats = fetch_execution_reward_adjustment(get_pg_conn_str(), lookback_minutes=60)
@@ -131,6 +166,7 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
             prior_histories = fetch_latest_generation_histories(
                 cur, task.profile_key, task.replication_factor
             )
+            oos = fetch_rolling_oos_metrics(cur, task.profile_key, OOS_LOOKBACK_EPISODES)
 
             confidence, result = BRIDGE.calculate_pool_and_forecast(
                 profile_key=task.profile_key,
@@ -143,12 +179,33 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
 
             if exec_penalty > 0.0:
                 confidence = max(0.0, round(confidence - exec_penalty, 4))
-                result["is_promoted_for_live"] = bool(
-                    result["is_promoted_for_live"] and confidence >= CONFIDENCE_THRESHOLD
-                )
+
+            oos_passes = (
+                oos["episodes"] >= MIN_OOS_EPISODES
+                and oos["avg_sharpe"] >= MIN_OOS_SHARPE
+                and oos["win_rate"] >= MIN_OOS_WIN_RATE
+                and oos["net_pnl"] > 0.0
+            )
+            step_promoted = bool(
+                result["is_promoted_for_live"]
+                and confidence >= CONFIDENCE_THRESHOLD
+                and oos_passes
+            )
+
+            if step_promoted:
+                streak = PROMOTED_STREAK_BY_PROFILE.get(task.profile_key, 0) + 1
+            else:
+                streak = 0
+            PROMOTED_STREAK_BY_PROFILE[task.profile_key] = streak
+            live_gate_open = streak >= MIN_CONSECUTIVE_PROMOTED_GENS
+
+            forecasts = result.get("forecast", {}).get("asset_forecasts", [])
+            top_edge_bps = max(
+                (abs(float(f.get("expected_return_bps", 0.0))) for f in forecasts),
+                default=0.0,
+            )
 
             if task.command == TaskCommandType.RECALCULATE_POOL:
-                # Expire any FK-referenced AVAILABLE slots rather than failing on FK delete
                 cur.execute(
                     """
                     UPDATE strategy_pool sp
@@ -173,6 +230,15 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                     (task.profile_key,),
                 )
                 for rep in result["replicas"]:
+                    enriched_payload = dict(rep["strategy_payload"])
+                    enriched_payload.update({
+                        "is_promoted_live": bool(live_gate_open and int(rep["replica_index"]) == 1),
+                        "confidence_score": round(float(confidence), 4),
+                        "expected_return_bps": round(float(top_edge_bps), 2),
+                        "consecutive_promoted_gens": int(streak),
+                        "oos_avg_sharpe": round(oos["avg_sharpe"], 4),
+                        "oos_win_rate": round(oos["win_rate"], 4),
+                    })
                     cur.execute(
                         """
                         INSERT INTO strategy_pool
@@ -185,7 +251,7 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                             rep["replica_index"],
                             task.risk_dial_r,
                             json.dumps(rep["jitter_delta"]),
-                            json.dumps(rep["strategy_payload"]),
+                            json.dumps(enriched_payload),
                             json.dumps(rep["candidate_symbols"]),
                         ),
                     )
@@ -198,6 +264,7 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                         "ohlcv_symbols": list(ohlcv_by_symbol.keys()),
                         "generation_count": BRIDGE.generation_count,
                         "generation_by_profile": BRIDGE.generation_by_profile,
+                        "promoted_streak_by_profile": PROMOTED_STREAK_BY_PROFILE,
                     },
                     confidence,
                 )
@@ -215,10 +282,9 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
                         b"",
                         b"{}",
                         confidence,
-                        result["is_promoted_for_live"],
+                        live_gate_open,
                     ),
                 )
-                # Keep table bounded so BYTEA checkpoints never bloat Postgres
                 cur.execute(
                     """
                     DELETE FROM nn_model_checkpoints
@@ -234,17 +300,18 @@ def handle_task(task: InputTaskMessage) -> tuple[float, dict]:
 
     print(
         f"[NN-EVOLUTION] Profile={task.profile_key} | Gen={result.get('generation', 0)} | "
-        f"OHLCV_Syms={len(ohlcv_by_symbol)}/{len(task.candidate_symbols)} | "
-        f"ExecPen={exec_penalty:.4f} (ord={exec_stats['total_orders']}) | "
-        f"Winner=Replica#{result['winning_prior_replica']} | Loss={result.get('train_loss', 0.0):.4f} | "
-        f"Confidence={confidence*100:.1f}% | Promoted={result['is_promoted_for_live']}",
+        f"OHLCV={len(ohlcv_by_symbol)}/{len(task.candidate_symbols)} | "
+        f"OOS(n={oos['episodes']} WR={oos['win_rate']*100:.0f}% Sh={oos['avg_sharpe']:.2f} PnL=${oos['net_pnl']:.2f}) | "
+        f"Edge={top_edge_bps:.1f}bps | Streak={streak}/{MIN_CONSECUTIVE_PROMOTED_GENS} | "
+        f"Winner=#{result['winning_prior_replica']} | Loss={result.get('train_loss', 0.0):.4f} | "
+        f"Conf={confidence*100:.1f}% | LiveGate={live_gate_open}",
         flush=True,
     )
 
     return confidence, {
         "profile_key": task.profile_key,
         "winning_prior_replica": result["winning_prior_replica"],
-        "is_promoted_for_live": result["is_promoted_for_live"],
+        "is_promoted_for_live": live_gate_open,
         "replicas_generated": len(result["replicas"]),
     }
 
